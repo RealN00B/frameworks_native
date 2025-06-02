@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <gui/DisplayLuts.h>
 #include <math/mat4.h>
 #include <math/vec3.h>
 #include <renderengine/ExternalTexture.h>
@@ -28,8 +29,10 @@
 #include <ui/GraphicTypes.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
+#include <ui/ShadowSettings.h>
 #include <ui/StretchEffect.h>
 #include <ui/Transform.h>
+#include "ui/EdgeExtensionEffect.h"
 
 #include <iosfwd>
 
@@ -46,10 +49,6 @@ struct Buffer {
     // Fence that will fire when the buffer is ready to be bound.
     sp<Fence> fence = nullptr;
 
-    // Texture identifier to bind the external texture to.
-    // TODO(alecmouri): This is GL-specific...make the type backend-agnostic.
-    uint32_t textureName = 0;
-
     // Whether to use filtering when rendering the texture.
     bool useTextureFiltering = false;
 
@@ -63,9 +62,6 @@ struct Buffer {
     // LayerSettings::alpha is still used if isOpaque==true - this flag only
     // overrides the alpha channel of the buffer.
     bool isOpaque = false;
-
-    // HDR color-space setting for Y410.
-    bool isY410BT2020 = false;
 
     float maxLuminanceNits = 0.0;
 };
@@ -87,7 +83,7 @@ struct Geometry {
     // rectangle to figure out how to apply the radius for this layer. The crop rectangle will be
     // in local layer coordinate space, so we have to take the layer transform into account when
     // walking up the tree.
-    float roundedCornersRadius = 0.0;
+    vec2 roundedCornersRadius = vec2(0.0f, 0.0f);
 
     // Rectangle within which corners will be rounded.
     FloatRect roundedCornersCrop = FloatRect();
@@ -102,36 +98,6 @@ struct PixelSource {
     // This should only be populated if we don't render from an application
     // buffer.
     half3 solidColor = half3(0.0f, 0.0f, 0.0f);
-};
-
-/*
- * Contains the configuration for the shadows drawn by single layer. Shadow follows
- * material design guidelines.
- */
-struct ShadowSettings {
-    // Boundaries of the shadow.
-    FloatRect boundaries = FloatRect();
-
-    // Color to the ambient shadow. The alpha is premultiplied.
-    vec4 ambientColor = vec4();
-
-    // Color to the spot shadow. The alpha is premultiplied. The position of the spot shadow
-    // depends on the light position.
-    vec4 spotColor = vec4();
-
-    // Position of the light source used to cast the spot shadow.
-    vec3 lightPos = vec3();
-
-    // Radius of the spot light source. Smaller radius will have sharper edges,
-    // larger radius will have softer shadows
-    float lightRadius = 0.f;
-
-    // Length of the cast shadow. If length is <= 0.f no shadows will be drawn.
-    float length = 0.f;
-
-    // If true fill in the casting layer is translucent and the shadow needs to fill the bounds.
-    // Otherwise the shadow will only be drawn around the edges of the casting layer.
-    bool casterIsTranslucent = false;
 };
 
 // The settings that RenderEngine requires for correctly rendering a Layer.
@@ -170,6 +136,7 @@ struct LayerSettings {
     mat4 blurRegionTransform = mat4();
 
     StretchEffect stretchEffect;
+    EdgeExtensionEffect edgeExtensionEffect;
 
     // Name associated with the layer for debugging purposes.
     std::string name;
@@ -179,18 +146,18 @@ struct LayerSettings {
     // If white point nits are unknown, then this layer is assumed to have the
     // same luminance as the brightest layer in the scene.
     float whitePointNits = -1.f;
+
+    std::shared_ptr<gui::DisplayLuts> luts;
 };
 
 // Keep in sync with custom comparison function in
 // compositionengine/impl/ClientCompositionRequestCache.cpp
 static inline bool operator==(const Buffer& lhs, const Buffer& rhs) {
     return lhs.buffer == rhs.buffer && lhs.fence == rhs.fence &&
-            lhs.textureName == rhs.textureName &&
             lhs.useTextureFiltering == rhs.useTextureFiltering &&
             lhs.textureTransform == rhs.textureTransform &&
             lhs.usePremultipliedAlpha == rhs.usePremultipliedAlpha &&
-            lhs.isOpaque == rhs.isOpaque && lhs.isY410BT2020 == rhs.isY410BT2020 &&
-            lhs.maxLuminanceNits == rhs.maxLuminanceNits;
+            lhs.isOpaque == rhs.isOpaque && lhs.maxLuminanceNits == rhs.maxLuminanceNits;
 }
 
 static inline bool operator==(const Geometry& lhs, const Geometry& rhs) {
@@ -201,17 +168,6 @@ static inline bool operator==(const Geometry& lhs, const Geometry& rhs) {
 
 static inline bool operator==(const PixelSource& lhs, const PixelSource& rhs) {
     return lhs.buffer == rhs.buffer && lhs.solidColor == rhs.solidColor;
-}
-
-static inline bool operator==(const ShadowSettings& lhs, const ShadowSettings& rhs) {
-    return lhs.boundaries == rhs.boundaries && lhs.ambientColor == rhs.ambientColor &&
-            lhs.spotColor == rhs.spotColor && lhs.lightPos == rhs.lightPos &&
-            lhs.lightRadius == rhs.lightRadius && lhs.length == rhs.length &&
-            lhs.casterIsTranslucent == rhs.casterIsTranslucent;
-}
-
-static inline bool operator!=(const ShadowSettings& lhs, const ShadowSettings& rhs) {
-    return !(operator==(lhs, rhs));
 }
 
 static inline bool operator==(const LayerSettings& lhs, const LayerSettings& rhs) {
@@ -232,7 +188,9 @@ static inline bool operator==(const LayerSettings& lhs, const LayerSettings& rhs
             lhs.skipContentDraw == rhs.skipContentDraw && lhs.shadow == rhs.shadow &&
             lhs.backgroundBlurRadius == rhs.backgroundBlurRadius &&
             lhs.blurRegionTransform == rhs.blurRegionTransform &&
-            lhs.stretchEffect == rhs.stretchEffect && lhs.whitePointNits == rhs.whitePointNits;
+            lhs.stretchEffect == rhs.stretchEffect &&
+            lhs.edgeExtensionEffect == rhs.edgeExtensionEffect &&
+            lhs.whitePointNits == rhs.whitePointNits && lhs.luts == rhs.luts;
 }
 
 static inline void PrintTo(const Buffer& settings, ::std::ostream* os) {
@@ -241,13 +199,11 @@ static inline void PrintTo(const Buffer& settings, ::std::ostream* os) {
         << (settings.buffer.get() ? decodePixelFormat(settings.buffer->getPixelFormat()).c_str()
                                   : "");
     *os << "\n    .fence = " << settings.fence.get();
-    *os << "\n    .textureName = " << settings.textureName;
     *os << "\n    .useTextureFiltering = " << settings.useTextureFiltering;
     *os << "\n    .textureTransform = ";
     PrintMatrix(settings.textureTransform, os);
     *os << "\n    .usePremultipliedAlpha = " << settings.usePremultipliedAlpha;
     *os << "\n    .isOpaque = " << settings.isOpaque;
-    *os << "\n    .isY410BT2020 = " << settings.isY410BT2020;
     *os << "\n    .maxLuminanceNits = " << settings.maxLuminanceNits;
     *os << "\n}";
 }
@@ -258,7 +214,8 @@ static inline void PrintTo(const Geometry& settings, ::std::ostream* os) {
     PrintTo(settings.boundaries, os);
     *os << "\n    .positionTransform = ";
     PrintMatrix(settings.positionTransform, os);
-    *os << "\n    .roundedCornersRadius = " << settings.roundedCornersRadius;
+    *os << "\n    .roundedCornersRadiusX = " << settings.roundedCornersRadius.x;
+    *os << "\n    .roundedCornersRadiusY = " << settings.roundedCornersRadius.y;
     *os << "\n    .roundedCornersCrop = ";
     PrintTo(settings.roundedCornersCrop, os);
     *os << "\n}";
@@ -304,6 +261,10 @@ static inline void PrintTo(const StretchEffect& effect, ::std::ostream* os) {
     *os << "\n}";
 }
 
+static inline void PrintTo(const EdgeExtensionEffect& effect, ::std::ostream* os) {
+    *os << effect;
+}
+
 static inline void PrintTo(const LayerSettings& settings, ::std::ostream* os) {
     *os << "LayerSettings for '" << settings.name.c_str() << "' {";
     *os << "\n    .geometry = ";
@@ -334,6 +295,10 @@ static inline void PrintTo(const LayerSettings& settings, ::std::ostream* os) {
     if (settings.stretchEffect != StretchEffect()) {
         *os << "\n    .stretchEffect = ";
         PrintTo(settings.stretchEffect, os);
+    }
+
+    if (settings.edgeExtensionEffect.hasEffect()) {
+        *os << "\n    .edgeExtensionEffect = " << settings.edgeExtensionEffect;
     }
     *os << "\n    .whitePointNits = " << settings.whitePointNits;
     *os << "\n}";

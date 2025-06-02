@@ -17,7 +17,7 @@
 #include <ftl/flags.h>
 #include <gtest/gtest.h>
 
-#include <type_traits>
+#include <initializer_list>
 
 namespace android::test {
 
@@ -35,6 +35,7 @@ TEST(Flags, Test) {
 
 TEST(Flags, Any) {
     Flags<TestFlags> flags = TestFlags::ONE | TestFlags::TWO;
+    ASSERT_TRUE(flags.any());
     ASSERT_TRUE(flags.any(TestFlags::ONE));
     ASSERT_TRUE(flags.any(TestFlags::TWO));
     ASSERT_FALSE(flags.any(TestFlags::THREE));
@@ -42,6 +43,9 @@ TEST(Flags, Any) {
     ASSERT_TRUE(flags.any(TestFlags::TWO | TestFlags::THREE));
     ASSERT_TRUE(flags.any(TestFlags::ONE | TestFlags::THREE));
     ASSERT_TRUE(flags.any(TestFlags::ONE | TestFlags::TWO | TestFlags::THREE));
+
+    Flags<TestFlags> emptyFlags;
+    ASSERT_FALSE(emptyFlags.any());
 }
 
 TEST(Flags, All) {
@@ -53,6 +57,18 @@ TEST(Flags, All) {
     ASSERT_FALSE(flags.all(TestFlags::TWO | TestFlags::THREE));
     ASSERT_FALSE(flags.all(TestFlags::ONE | TestFlags::THREE));
     ASSERT_FALSE(flags.all(TestFlags::ONE | TestFlags::TWO | TestFlags::THREE));
+}
+
+TEST(Flags, ImplicitConstructionAndAssignmentFromInitializerList) {
+    Flags<TestFlags> flags = {TestFlags::ONE, TestFlags::THREE};
+    ASSERT_TRUE(flags.test(TestFlags::ONE));
+    ASSERT_FALSE(flags.test(TestFlags::TWO));
+    ASSERT_TRUE(flags.test(TestFlags::THREE));
+
+    flags = {};
+    ASSERT_FALSE(flags.test(TestFlags::ONE));
+    ASSERT_FALSE(flags.test(TestFlags::TWO));
+    ASSERT_FALSE(flags.test(TestFlags::THREE));
 }
 
 TEST(Flags, DefaultConstructor_hasNoFlagsSet) {

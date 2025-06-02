@@ -32,8 +32,10 @@
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
 #pragma clang diagnostic pop // ignored "-Wconversion -Wextra"
 
+#include <compositionengine/CompositionRefreshArgs.h>
 #include <compositionengine/ProjectionSpace.h>
 #include <ui/LayerStack.h>
+#include <ui/PictureProfileHandle.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 #include <ui/Transform.h>
@@ -50,6 +52,9 @@ struct OutputCompositionState {
 
     // If false, this output is not considered secure
     bool isSecure{false};
+
+    // If false, this output is not considered protected
+    bool isProtected{false};
 
     // If true, the current frame on this output uses client composition
     bool usesClientComposition{false};
@@ -114,22 +119,19 @@ struct OutputCompositionState {
     // Current active dataspace
     ui::Dataspace dataspace{ui::Dataspace::UNKNOWN};
 
-    // Current target dataspace
-    ui::Dataspace targetDataspace{ui::Dataspace::UNKNOWN};
-
     std::optional<android::HWComposer::DeviceRequestedChanges> previousDeviceRequestedChanges{};
 
     bool previousDeviceRequestedSuccess = false;
 
+    // Optional.
     // The earliest time to send the present command to the HAL
-    std::chrono::steady_clock::time_point earliestPresentTime;
-
-    // The previous present fence. Used together with earliestPresentTime
-    // to prevent an early presentation of a frame.
-    std::shared_ptr<FenceTime> previousPresentFence;
+    std::optional<std::chrono::steady_clock::time_point> earliestPresentTime;
 
     // The expected time for the next present
     nsecs_t expectedPresentTime{0};
+
+    // The frameInterval for the next present
+    Fps frameInterval{};
 
     // Current display brightness
     float displayBrightnessNits{-1.f};
@@ -166,6 +168,10 @@ struct OutputCompositionState {
 
     uint64_t lastOutputLayerHash = 0;
     uint64_t outputLayerHash = 0;
+
+    ICEPowerCallback* powerCallback = nullptr;
+
+    PictureProfileHandle pictureProfileHandle;
 
     // Debugging
     void dump(std::string& result) const;

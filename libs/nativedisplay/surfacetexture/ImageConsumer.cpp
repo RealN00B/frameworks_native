@@ -19,7 +19,7 @@
 #include <surfacetexture/SurfaceTexture.h>
 
 // Macro for including the SurfaceTexture name in log messages
-#define IMG_LOGE(x, ...) ALOGE("[%s] " x, st.mName.string(), ##__VA_ARGS__)
+#define IMG_LOGE(x, ...) ALOGE("[%s] " x, st.mName.c_str(), ##__VA_ARGS__)
 
 namespace android {
 
@@ -64,8 +64,7 @@ sp<GraphicBuffer> ImageConsumer::dequeueBuffer(int* outSlotid, android_dataspace
         // Wait on the producer fence for the buffer to be ready.
         err = fenceWait(item.mFence->get(), fencePassThroughHandle);
         if (err != OK) {
-            st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer, EGL_NO_DISPLAY,
-                                   EGL_NO_SYNC_KHR);
+            st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer);
             return nullptr;
         }
     }
@@ -79,8 +78,7 @@ sp<GraphicBuffer> ImageConsumer::dequeueBuffer(int* outSlotid, android_dataspace
         err = createFence(st.mUseFenceSync, &mImageSlots[slot].eglFence(), &display,
                           &releaseFenceId, fencePassThroughHandle);
         if (OK != err) {
-            st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer, EGL_NO_DISPLAY,
-                                   EGL_NO_SYNC_KHR);
+            st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer);
             return nullptr;
         }
 
@@ -91,8 +89,7 @@ sp<GraphicBuffer> ImageConsumer::dequeueBuffer(int* outSlotid, android_dataspace
                                                     releaseFence);
             if (err != OK) {
                 IMG_LOGE("dequeueImage: error adding release fence: %s (%d)", strerror(-err), err);
-                st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer, EGL_NO_DISPLAY,
-                                       EGL_NO_SYNC_KHR);
+                st.releaseBufferLocked(slot, st.mSlots[slot].mGraphicBuffer);
                 return nullptr;
             }
         }

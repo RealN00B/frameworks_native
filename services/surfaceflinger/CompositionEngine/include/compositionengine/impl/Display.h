@@ -30,7 +30,7 @@
 #include <ui/DisplayIdentification.h>
 
 #include "DisplayHardware/HWComposer.h"
-#include "DisplayHardware/PowerAdvisor.h"
+#include "PowerAdvisor/PowerAdvisor.h"
 
 namespace android::compositionengine {
 
@@ -45,7 +45,7 @@ public:
     virtual ~Display();
 
     // compositionengine::Output overrides
-    std::optional<DisplayId> getDisplayId() const override;
+    ftl::Optional<DisplayId> getDisplayId() const override;
     bool isValid() const override;
     void dump(std::string&) const override;
     using compositionengine::impl::Output::setReleasedLayers;
@@ -59,9 +59,11 @@ public:
             std::optional<android::HWComposer::DeviceRequestedChanges>*) override;
     void applyCompositionStrategy(const std::optional<DeviceRequestedChanges>&) override;
     bool getSkipColorTransform() const override;
-    compositionengine::Output::FrameFences presentAndGetFrameFences() override;
+    compositionengine::Output::FrameFences presentFrame() override;
+    void executeCommands() override;
     void setExpensiveRenderingExpected(bool) override;
-    void finishFrame(const CompositionRefreshArgs&, GpuCompositionResult&&) override;
+    void finishFrame(GpuCompositionResult&&) override;
+    bool supportsOffloadPresent() const override;
 
     // compositionengine::Display overrides
     DisplayId getId() const override;
@@ -72,18 +74,21 @@ public:
             const compositionengine::DisplayColorProfileCreationArgs&) override;
     void createRenderSurface(const compositionengine::RenderSurfaceCreationArgs&) override;
     void createClientCompositionCache(uint32_t cacheSize) override;
-    void applyDisplayBrightness(const bool applyImmediately) override;
+    void applyDisplayBrightness(bool applyImmediately) override;
+    void setSecure(bool secure) override;
 
     // Internal helpers used by chooseCompositionStrategy()
     using ChangedTypes = android::HWComposer::DeviceRequestedChanges::ChangedTypes;
     using DisplayRequests = android::HWComposer::DeviceRequestedChanges::DisplayRequests;
     using LayerRequests = android::HWComposer::DeviceRequestedChanges::LayerRequests;
     using ClientTargetProperty = android::HWComposer::DeviceRequestedChanges::ClientTargetProperty;
+    using LayerLuts = android::HWComposer::DeviceRequestedChanges::LayerLuts;
     virtual bool allLayersRequireClientComposition() const;
     virtual void applyChangedTypesToLayers(const ChangedTypes&);
     virtual void applyDisplayRequests(const DisplayRequests&);
     virtual void applyLayerRequestsToLayers(const LayerRequests&);
     virtual void applyClientTargetRequests(const ClientTargetProperty&);
+    virtual void applyLayerLutsToLayers(const LayerLuts&);
 
     // Internal
     virtual void setConfiguration(const compositionengine::DisplayCreationArgs&);
@@ -91,10 +96,20 @@ public:
 
 private:
     bool isPowerHintSessionEnabled() override;
+    bool isPowerHintSessionGpuReportingEnabled() override;
+    void setHintSessionGpuStart(TimePoint startTime) override;
     void setHintSessionGpuFence(std::unique_ptr<FenceTime>&& gpuFence) override;
+    void setHintSessionRequiresRenderEngine(bool requiresRenderEngine) override;
+    const aidl::android::hardware::graphics::composer3::OverlayProperties* getOverlaySupport()
+            override;
+    bool hasPictureProcessing() const override;
+    int32_t getMaxLayerPictureProfiles() const override;
+
     DisplayId mId;
     bool mIsDisconnected = false;
-    Hwc2::PowerAdvisor* mPowerAdvisor = nullptr;
+    adpf::PowerAdvisor* mPowerAdvisor = nullptr;
+    bool mHasPictureProcessing = false;
+    int32_t mMaxLayerPictureProfiles = 0;
 };
 
 // This template factory function standardizes the implementation details of the

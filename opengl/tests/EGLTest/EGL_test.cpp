@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include <SurfaceFlingerProperties.h>
 #include <android/hardware/configstore/1.0/ISurfaceFlingerConfigs.h>
@@ -28,6 +29,8 @@
 #include <gui/IProducerListener.h>
 #include <gui/IGraphicBufferConsumer.h>
 #include <gui/BufferQueue.h>
+
+#include "egl_display.h"
 
 bool hasEglExtension(EGLDisplay dpy, const char* extensionName) {
     const char* exts = eglQueryString(dpy, EGL_EXTENSIONS);
@@ -343,6 +346,11 @@ TEST_F(EGLTest, EGLDisplayP3Passthrough) {
 }
 
 TEST_F(EGLTest, EGLDisplayP31010102) {
+    // This test has been failing since:
+    // libEGL: When driver doesn't understand P3, map sRGB-encoded P3 to sRGB
+    // https://android-review.git.corp.google.com/c/platform/frameworks/native/+/793504
+    GTEST_SKIP() << "Skipping broken test. See b/120714942 and b/117104367";
+
     EGLint numConfigs;
     EGLConfig config;
     EGLBoolean success;
@@ -757,6 +765,30 @@ TEST_F(EGLTest, EGLNoConfigContext) {
     }
 }
 
+// Verify that eglCreateContext works when EGL_TELEMETRY_HINT_ANDROID is used with
+// NO_HINT = 0, SKIP_TELEMETRY = 1 and an invalid of value of 2
+TEST_F(EGLTest, EGLContextTelemetryHintExt) {
+    for (int i = 0; i < 3; i++) {
+        EGLConfig config;
+        get8BitConfig(config);
+        std::vector<EGLint> contextAttributes;
+        contextAttributes.reserve(4);
+        contextAttributes.push_back(EGL_TELEMETRY_HINT_ANDROID);
+        contextAttributes.push_back(i);
+        contextAttributes.push_back(EGL_NONE);
+        contextAttributes.push_back(EGL_NONE);
+
+        EGLContext eglContext = eglCreateContext(mEglDisplay, config, EGL_NO_CONTEXT,
+                                                 contextAttributes.data());
+        EXPECT_NE(EGL_NO_CONTEXT, eglContext);
+        EXPECT_EQ(EGL_SUCCESS, eglGetError());
+
+        if (eglContext != EGL_NO_CONTEXT) {
+            eglDestroyContext(mEglDisplay, eglContext);
+        }
+    }
+}
+
 // Emulate what a native application would do to create a
 // 10:10:10:2 surface.
 TEST_F(EGLTest, EGLConfig1010102) {
@@ -866,6 +898,12 @@ TEST_F(EGLTest, EGLUnsupportedColorspaceFormatCombo) {
     EGLConfig config;
     EGLBoolean success;
 
+    if (!hasWideColorDisplay) {
+        // skip this test if device does not have wide-color display
+        RecordProperty("hasWideColorDisplay", false);
+        return;
+    }
+
     const EGLint attrs[] = {
             // clang-format off
             EGL_SURFACE_TYPE,             EGL_WINDOW_BIT,
@@ -951,6 +989,12 @@ TEST_F(EGLTest, EGLCreateWindowFailAndSucceed) {
 TEST_F(EGLTest, EGLCreateWindowTwoColorspaces) {
     EGLConfig config;
 
+    if (!hasWideColorDisplay) {
+        // skip this test if device does not have wide-color display
+        RecordProperty("hasWideColorDisplay", false);
+        return;
+    }
+
     ASSERT_NO_FATAL_FAILURE(get8BitConfig(config));
 
     struct MockConsumer : public BnConsumerListener {
@@ -994,4 +1038,57 @@ TEST_F(EGLTest, EGLCreateWindowTwoColorspaces) {
 
     EXPECT_TRUE(eglDestroySurface(mEglDisplay, eglSurface));
 }
+
+TEST_F(EGLTest, EGLCheckExtensionString) {
+    // check that the format of the extension string is correct
+
+    egl_display_t* display = egl_display_t::get(mEglDisplay);
+    ASSERT_NE(display, nullptr);
+
+    std::string extensionStrRegex = "((EGL_ANDROID_front_buffer_auto_refresh|"
+       "EGL_ANDROID_get_native_client_buffer|"
+       "EGL_ANDROID_presentation_time|"
+       "EGL_EXT_surface_CTA861_3_metadata|"
+       "EGL_EXT_surface_SMPTE2086_metadata|"
+       "EGL_KHR_get_all_proc_addresses|"
+       "EGL_KHR_swap_buffers_with_damage|"
+       "EGL_ANDROID_get_frame_timestamps|"
+       "EGL_EXT_gl_colorspace_scrgb|"
+       "EGL_EXT_gl_colorspace_scrgb_linear|"
+       "EGL_EXT_gl_colorspace_display_p3_linear|"
+       "EGL_EXT_gl_colorspace_display_p3|"
+       "EGL_EXT_gl_colorspace_display_p3_passthrough|"
+       "EGL_EXT_gl_colorspace_bt2020_hlg|"
+       "EGL_EXT_gl_colorspace_bt2020_linear|"
+       "EGL_EXT_gl_colorspace_bt2020_pq|"
+       "EGL_ANDROID_image_native_buffer|"
+       "EGL_ANDROID_native_fence_sync|"
+       "EGL_ANDROID_recordable|"
+       "EGL_EXT_create_context_robustness|"
+       "EGL_EXT_image_gl_colorspace|"
+       "EGL_EXT_pixel_format_float|"
+       "EGL_EXT_protected_content|"
+       "EGL_EXT_yuv_surface|"
+       "EGL_IMG_context_priority|"
+       "EGL_KHR_config_attribs|"
+       "EGL_KHR_create_context|"
+       "EGL_KHR_fence_sync|"
+       "EGL_KHR_gl_colorspace|"
+       "EGL_KHR_gl_renderbuffer_image|"
+       "EGL_KHR_gl_texture_2D_image|"
+       "EGL_KHR_gl_texture_3D_image|"
+       "EGL_KHR_gl_texture_cubemap_image|"
+       "EGL_KHR_image|"
+       "EGL_KHR_image_base|"
+       "EGL_KHR_mutable_render_buffer|"
+       "EGL_KHR_no_config_context|"
+       "EGL_KHR_partial_update|"
+       "EGL_KHR_surfaceless_context|"
+       "EGL_KHR_wait_sync|"
+       "EGL_EXT_buffer_age|"
+       "EGL_KHR_reusable_sync|"
+       "EGL_NV_context_priority_realtime) )+";
+    EXPECT_THAT(display->getExtensionString(), testing::MatchesRegex(extensionStrRegex));
+}
+
 }

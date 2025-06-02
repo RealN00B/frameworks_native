@@ -30,23 +30,7 @@
 
 namespace android {
 
-class StreamSplitterTest : public ::testing::Test {
-
-protected:
-    StreamSplitterTest() {
-        const ::testing::TestInfo* const testInfo =
-            ::testing::UnitTest::GetInstance()->current_test_info();
-        ALOGV("Begin test: %s.%s", testInfo->test_case_name(),
-                testInfo->name());
-    }
-
-    ~StreamSplitterTest() {
-        const ::testing::TestInfo* const testInfo =
-            ::testing::UnitTest::GetInstance()->current_test_info();
-        ALOGV("End test:   %s.%s", testInfo->test_case_name(),
-                testInfo->name());
-    }
-};
+class StreamSplitterTest : public ::testing::Test {};
 
 struct FakeListener : public BnConsumerListener {
     virtual void onFrameAvailable(const BufferItem& /* item */) {}
@@ -111,8 +95,7 @@ TEST_F(StreamSplitterTest, OneInputOneOutput) {
     ASSERT_EQ(*dataOut, TEST_DATA);
     ASSERT_EQ(OK, item.mGraphicBuffer->unlock());
 
-    ASSERT_EQ(OK, outputConsumer->releaseBuffer(item.mSlot, item.mFrameNumber,
-            EGL_NO_DISPLAY, EGL_NO_SYNC_KHR, Fence::NO_FENCE));
+    ASSERT_EQ(OK, outputConsumer->releaseBuffer(item.mSlot, item.mFrameNumber, Fence::NO_FENCE));
 
     // This should succeed even with allocation disabled since it will have
     // received the buffer back from the output BufferQueue
@@ -184,9 +167,9 @@ TEST_F(StreamSplitterTest, OneInputMultipleOutputs) {
         ASSERT_EQ(*dataOut, TEST_DATA);
         ASSERT_EQ(OK, item.mGraphicBuffer->unlock());
 
-        ASSERT_EQ(OK, outputConsumers[output]->releaseBuffer(item.mSlot,
-                    item.mFrameNumber, EGL_NO_DISPLAY, EGL_NO_SYNC_KHR,
-                    Fence::NO_FENCE));
+        ASSERT_EQ(OK,
+                  outputConsumers[output]->releaseBuffer(item.mSlot, item.mFrameNumber,
+                                                         Fence::NO_FENCE));
     }
 
     // This should succeed even with allocation disabled since it will have

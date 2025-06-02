@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _UI_INPUT_THREAD_H
-#define _UI_INPUT_THREAD_H
+#pragma once
 
 #include <utils/Thread.h>
 
@@ -29,18 +28,15 @@ namespace android {
  */
 class InputThread {
 public:
-    explicit InputThread(std::string name, std::function<void()> loop,
-                         std::function<void()> wake = nullptr);
+    explicit InputThread(std::string name, std::function<void()> loop, std::function<void()> wake,
+                         bool isInCriticalPath);
     virtual ~InputThread();
 
     bool isCallingThread();
 
 private:
-    std::string mName;
     std::function<void()> mThreadWake;
     sp<Thread> mThread;
 };
 
 } // namespace android
-
-#endif // _UI_INPUT_THREAD_H

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <gmock/gmock.h>
+#include <cstdint>
 
 #include "DisplayHardware/HWC2.h"
 
@@ -35,6 +36,7 @@ public:
                 (const, override));
     MOCK_METHOD(bool, isVsyncPeriodSwitchSupported, (), (const, override));
     MOCK_METHOD(void, onLayerDestroyed, (hal::HWLayerId), (override));
+    MOCK_METHOD(std::optional<ui::Size>, getPhysicalSizeInMm, (), (const override));
 
     MOCK_METHOD(hal::Error, acceptChanges, (), (override));
     MOCK_METHOD((base::expected<std::shared_ptr<HWC2::Layer>, hal::Error>), createLayer, (),
@@ -51,9 +53,10 @@ public:
                 (override));
     MOCK_METHOD(hal::Error, getName, (std::string *), (const, override));
     MOCK_METHOD(hal::Error, getRequests,
-                (hal::DisplayRequest *, (std::unordered_map<Layer *, hal::LayerRequest> *)),
+                (hal::DisplayRequest*, (std::unordered_map<Layer*, hal::LayerRequest>*)),
                 (override));
-    MOCK_METHOD(hal::Error, getConnectionType, (ui::DisplayConnectionType *), (const, override));
+    MOCK_METHOD((ftl::Expected<ui::DisplayConnectionType, hal::Error>), getConnectionType, (),
+                (const, override));
     MOCK_METHOD(hal::Error, supportsDoze, (bool *), (const, override));
     MOCK_METHOD(hal::Error, getHdrCapabilities, (android::HdrCapabilities *), (const, override));
     MOCK_METHOD(hal::Error, getDisplayedContentSamplingAttributes,
@@ -66,8 +69,8 @@ public:
                 ((std::unordered_map<Layer *, android::sp<android::Fence>> *)), (const, override));
     MOCK_METHOD(hal::Error, present, (android::sp<android::Fence> *), (override));
     MOCK_METHOD(hal::Error, setClientTarget,
-                (uint32_t, const android::sp<android::GraphicBuffer> &,
-                 const android::sp<android::Fence> &, hal::Dataspace),
+                (uint32_t, const android::sp<android::GraphicBuffer>&,
+                 const android::sp<android::Fence>&, hal::Dataspace, float),
                 (override));
     MOCK_METHOD(hal::Error, setColorMode, (hal::ColorMode, hal::RenderIntent), (override));
     MOCK_METHOD(hal::Error, setColorTransform, (const android::mat4 &), (override));
@@ -76,15 +79,15 @@ public:
                 (override));
     MOCK_METHOD(hal::Error, setPowerMode, (hal::PowerMode), (override));
     MOCK_METHOD(hal::Error, setVsyncEnabled, (hal::Vsync), (override));
-    MOCK_METHOD(hal::Error, validate, (nsecs_t, uint32_t *, uint32_t *), (override));
+    MOCK_METHOD(hal::Error, validate, (nsecs_t, int32_t, uint32_t*, uint32_t*), (override));
     MOCK_METHOD(hal::Error, presentOrValidate,
-                (nsecs_t, uint32_t *, uint32_t *, android::sp<android::Fence> *, uint32_t *),
+                (nsecs_t, int32_t, uint32_t*, uint32_t*, android::sp<android::Fence>*, uint32_t*),
                 (override));
     MOCK_METHOD(ftl::Future<hal::Error>, setDisplayBrightness,
                 (float, float, const Hwc2::Composer::DisplayBrightnessOptions &), (override));
     MOCK_METHOD(hal::Error, setActiveConfigWithConstraints,
-                (hal::HWConfigId, const hal::VsyncPeriodChangeConstraints &,
-                 hal::VsyncPeriodChangeTimeline *),
+                (hal::HWConfigId, const hal::VsyncPeriodChangeConstraints&,
+                 hal::VsyncPeriodChangeTimeline*),
                 (override));
     MOCK_METHOD(hal::Error, setBootDisplayConfig, (hal::HWConfigId), (override));
     MOCK_METHOD(hal::Error, clearBootDisplayConfig, (), (override));
@@ -105,6 +108,14 @@ public:
     MOCK_METHOD(bool, hasDisplayIdleTimerCapability, (), (const override));
     MOCK_METHOD(hal::Error, getPhysicalDisplayOrientation, (Hwc2::AidlTransform *),
                 (const override));
+    MOCK_METHOD(hal::Error, getOverlaySupport,
+                (aidl::android::hardware::graphics::composer3::OverlayProperties *),
+                (const override));
+    MOCK_METHOD(hal::Error, getRequestedLuts,
+                (HWC2::Display::LayerLuts*, HWC2::Display::LutFileDescriptorMapper&), (override));
+    MOCK_METHOD(hal::Error, getMaxLayerPictureProfiles, (int32_t*), (override));
+    MOCK_METHOD(hal::Error, setPictureProfileHandle, (const android::PictureProfileHandle&),
+                (override));
 };
 
 class Layer : public HWC2::Layer {
@@ -118,6 +129,8 @@ public:
                 (uint32_t, const android::sp<android::GraphicBuffer> &,
                  const android::sp<android::Fence> &),
                 (override));
+    MOCK_METHOD(hal::Error, setBufferSlotsToClear,
+                (const std::vector<uint32_t>& slotsToClear, uint32_t activeBufferSlot), (override));
     MOCK_METHOD(hal::Error, setSurfaceDamage, (const android::Region &), (override));
     MOCK_METHOD(hal::Error, setBlendMode, (hal::BlendMode), (override));
     MOCK_METHOD(hal::Error, setColor, (aidl::android::hardware::graphics::composer3::Color),
@@ -139,6 +152,10 @@ public:
                 (const std::string &, bool, const std::vector<uint8_t> &), (override));
     MOCK_METHOD(hal::Error, setBrightness, (float), (override));
     MOCK_METHOD(hal::Error, setBlockingRegion, (const android::Region &), (override));
+    MOCK_METHOD(hal::Error, setLuts, (aidl::android::hardware::graphics::composer3::Luts&),
+                (override));
+    MOCK_METHOD(hal::Error, setPictureProfileHandle, (const android::PictureProfileHandle&),
+                (override));
 };
 
 } // namespace android::HWC2::mock

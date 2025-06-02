@@ -22,6 +22,7 @@
 #include <bitset>
 #include <cstdint>
 #include <iterator>
+#include <initializer_list>
 #include <string>
 #include <type_traits>
 
@@ -40,6 +41,7 @@ class Flags {
 
 public:
     constexpr Flags(F f) : mFlags(static_cast<U>(f)) {}
+    constexpr Flags(std::initializer_list<F> fs) : mFlags(combine(fs)) {}
     constexpr Flags() : mFlags(0) {}
     constexpr Flags(const Flags<F>& f) : mFlags(f.mFlags) {}
 
@@ -120,12 +122,12 @@ public:
     }
 
     /* Tests whether any of the given flags are set */
-    bool any(Flags<F> f) const { return (mFlags & f.mFlags) != 0; }
+    bool any(Flags<F> f = ~Flags<F>()) const { return (mFlags & f.mFlags) != 0; }
 
     /* Tests whether all of the given flags are set */
     bool all(Flags<F> f) const { return (mFlags & f.mFlags) == f.mFlags; }
 
-    Flags<F> operator|(Flags<F> rhs) const { return static_cast<F>(mFlags | rhs.mFlags); }
+    constexpr Flags<F> operator|(Flags<F> rhs) const { return static_cast<F>(mFlags | rhs.mFlags); }
     Flags<F>& operator|=(Flags<F> rhs) {
         mFlags = mFlags | rhs.mFlags;
         return *this;
@@ -197,6 +199,14 @@ public:
 private:
     U mFlags;
 
+    static constexpr U combine(std::initializer_list<F> fs) {
+        U result = 0;
+        for (const F f : fs) {
+            result |= static_cast<U>(f);
+        }
+        return result;
+    }
+
     static void appendFlag(std::string& str, const std::string_view& flag, bool& first) {
         if (first) {
             first = false;
@@ -217,7 +227,7 @@ inline Flags<F> operator~(F f) {
 }
 
 template <typename F, typename = std::enable_if_t<is_scoped_enum_v<F>>>
-Flags<F> operator|(F lhs, F rhs) {
+constexpr Flags<F> operator|(F lhs, F rhs) {
     return static_cast<F>(to_underlying(lhs) | to_underlying(rhs));
 }
 

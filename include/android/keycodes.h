@@ -776,7 +776,111 @@ enum {
     AKEYCODE_THUMBS_DOWN = 287,
     /** Used to switch current account that is consuming content.
      * May be consumed by system to switch current viewer profile. */
-    AKEYCODE_PROFILE_SWITCH = 288
+    AKEYCODE_PROFILE_SWITCH = 288,
+    /** Video Application key #1. */
+    AKEYCODE_VIDEO_APP_1 = 289,
+    /** Video Application key #2. */
+    AKEYCODE_VIDEO_APP_2 = 290,
+    /** Video Application key #3. */
+    AKEYCODE_VIDEO_APP_3 = 291,
+    /** Video Application key #4. */
+    AKEYCODE_VIDEO_APP_4 = 292,
+    /** Video Application key #5. */
+    AKEYCODE_VIDEO_APP_5 = 293,
+    /** Video Application key #6. */
+    AKEYCODE_VIDEO_APP_6 = 294,
+    /** Video Application key #7. */
+    AKEYCODE_VIDEO_APP_7 = 295,
+    /** Video Application key #8. */
+    AKEYCODE_VIDEO_APP_8 = 296,
+    /** Featured Application key #1. */
+    AKEYCODE_FEATURED_APP_1 = 297,
+    /** Featured Application key #2. */
+    AKEYCODE_FEATURED_APP_2 = 298,
+    /** Featured Application key #3. */
+    AKEYCODE_FEATURED_APP_3 = 299,
+    /** Featured Application key #4. */
+    AKEYCODE_FEATURED_APP_4 = 300,
+    /** Demo Application key #1. */
+    AKEYCODE_DEMO_APP_1 = 301,
+    /** Demo Application key #2. */
+    AKEYCODE_DEMO_APP_2 = 302,
+    /** Demo Application key #3. */
+    AKEYCODE_DEMO_APP_3 = 303,
+    /** Demo Application key #4. */
+    AKEYCODE_DEMO_APP_4 = 304,
+    /** Keyboard backlight Down key.
+     * Adjusts the keyboard backlight brightness down. */
+    AKEYCODE_KEYBOARD_BACKLIGHT_DOWN = 305,
+    /** Keyboard backlight Up key.
+     * Adjusts the keyboard backlight brightness up. */
+    AKEYCODE_KEYBOARD_BACKLIGHT_UP = 306,
+    /** Keyboard backlight Toggle key.
+     * Toggles the keyboard backlight on/off. */
+    AKEYCODE_KEYBOARD_BACKLIGHT_TOGGLE = 307,
+    /** The primary button on the barrel of a stylus.
+     * This is usually the button closest to the tip of the stylus. */
+    AKEYCODE_STYLUS_BUTTON_PRIMARY = 308,
+    /** The secondary button on the barrel of a stylus.
+     * This is usually the second button from the tip of the stylus. */
+    AKEYCODE_STYLUS_BUTTON_SECONDARY = 309,
+    /** The tertiary button on the barrel of a stylus.
+     * This is usually the third button from the tip of the stylus. */
+    AKEYCODE_STYLUS_BUTTON_TERTIARY = 310,
+    /** A button on the tail end of a stylus. */
+    AKEYCODE_STYLUS_BUTTON_TAIL = 311,
+    /** Key to open recent apps (a.k.a. Overview) */
+    AKEYCODE_RECENT_APPS = 312,
+    /** User customizable key #1. */
+    AKEYCODE_MACRO_1 = 313,
+    /** User customizable key #2. */
+    AKEYCODE_MACRO_2 = 314,
+    /** User customizable key #3. */
+    AKEYCODE_MACRO_3 = 315,
+    /** User customizable key #4. */
+    AKEYCODE_MACRO_4 = 316,
+    /** Open Emoji picker */
+    AKEYCODE_EMOJI_PICKER = 317,
+    /** Take Screenshot */
+    AKEYCODE_SCREENSHOT = 318,
+    /** To start dictate to an input field */
+    AKEYCODE_DICTATE = 319,
+    /** AC New */
+    AKEYCODE_NEW = 320,
+    /** AC Close */
+    AKEYCODE_CLOSE = 321,
+    /** To toggle 'Do Not Disturb' mode */
+    AKEYCODE_DO_NOT_DISTURB = 322,
+    /** To Print */
+    AKEYCODE_PRINT = 323,
+    /** To Lock the screen */
+    AKEYCODE_LOCK = 324,
+    /** To toggle fullscreen mode (on the current application) */
+    AKEYCODE_FULLSCREEN = 325,
+    /** F13 key */
+    AKEYCODE_F13 = 326,
+    /** F14 key */
+    AKEYCODE_F14 = 327,
+    /** F15 key */
+    AKEYCODE_F15 = 328,
+    /** F16 key */
+    AKEYCODE_F16 = 329,
+    /** F17 key */
+    AKEYCODE_F17 = 330,
+    /** F18 key */
+    AKEYCODE_F18 = 331,
+    /** F19 key */
+    AKEYCODE_F19 = 332,
+    /** F20 key */
+    AKEYCODE_F20 = 333,
+    /** F21 key */
+    AKEYCODE_F21 = 334,
+    /** F22 key */
+    AKEYCODE_F22 = 335,
+    /** F23 key */
+    AKEYCODE_F23 = 336,
+    /** F24 key */
+    AKEYCODE_F24 = 337,
 
     // NOTE: If you add a new keycode here you must also add it to several other files.
     //       Refer to frameworks/base/core/java/android/view/KeyEvent.java for the full list.

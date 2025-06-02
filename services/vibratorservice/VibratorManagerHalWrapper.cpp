@@ -20,7 +20,7 @@
 
 #include <vibratorservice/VibratorManagerHalWrapper.h>
 
-namespace Aidl = android::hardware::vibrator;
+namespace Aidl = aidl::android::hardware::vibrator;
 
 namespace android {
 
@@ -28,6 +28,30 @@ namespace vibrator {
 
 constexpr int32_t SINGLE_VIBRATOR_ID = 0;
 const constexpr char* MISSING_VIBRATOR_MESSAGE_PREFIX = "No vibrator with id=";
+
+HalResult<void> ManagerHalWrapper::prepareSynced(const std::vector<int32_t>&) {
+    return HalResult<void>::unsupported();
+}
+
+HalResult<void> ManagerHalWrapper::triggerSynced(const std::function<void()>&) {
+    return HalResult<void>::unsupported();
+}
+
+HalResult<void> ManagerHalWrapper::cancelSynced() {
+    return HalResult<void>::unsupported();
+}
+
+HalResult<std::shared_ptr<Aidl::IVibrationSession>> ManagerHalWrapper::startSession(
+        const std::vector<int32_t>&, const Aidl::VibrationSessionConfig&,
+        const std::function<void()>&) {
+    return HalResult<std::shared_ptr<Aidl::IVibrationSession>>::unsupported();
+}
+
+HalResult<void> ManagerHalWrapper::clearSessions() {
+    return HalResult<void>::unsupported();
+}
+
+// -------------------------------------------------------------------------------------------------
 
 HalResult<void> LegacyManagerHalWrapper::ping() {
     auto pingFn = [](HalWrapper* hal) { return hal->ping(); };
@@ -55,30 +79,19 @@ HalResult<std::shared_ptr<HalController>> LegacyManagerHalWrapper::getVibrator(i
         return HalResult<std::shared_ptr<HalController>>::ok(mController);
     }
     // Controller.init did not connect to any vibrator HAL service, so the device has no vibrator.
-    return HalResult<std::shared_ptr<HalController>>::failed(MISSING_VIBRATOR_MESSAGE_PREFIX +
-                                                             std::to_string(id));
-}
-
-HalResult<void> LegacyManagerHalWrapper::prepareSynced(const std::vector<int32_t>&) {
-    return HalResult<void>::unsupported();
-}
-
-HalResult<void> LegacyManagerHalWrapper::triggerSynced(const std::function<void()>&) {
-    return HalResult<void>::unsupported();
-}
-
-HalResult<void> LegacyManagerHalWrapper::cancelSynced() {
-    return HalResult<void>::unsupported();
+    return HalResult<std::shared_ptr<HalController>>::failed(
+            (MISSING_VIBRATOR_MESSAGE_PREFIX + std::to_string(id)).c_str());
 }
 
 // -------------------------------------------------------------------------------------------------
 
 std::shared_ptr<HalWrapper> AidlManagerHalWrapper::connectToVibrator(
         int32_t vibratorId, std::shared_ptr<CallbackScheduler> callbackScheduler) {
-    std::function<HalResult<sp<Aidl::IVibrator>>()> reconnectFn = [=]() {
-        sp<Aidl::IVibrator> vibrator;
-        auto result = this->getHal()->getVibrator(vibratorId, &vibrator);
-        return HalResult<sp<Aidl::IVibrator>>::fromStatus(result, vibrator);
+    std::function<HalResult<std::shared_ptr<Aidl::IVibrator>>()> reconnectFn = [=, this]() {
+        std::shared_ptr<Aidl::IVibrator> vibrator;
+        auto status = this->getHal()->getVibrator(vibratorId, &vibrator);
+        return HalResultFactory::fromStatus<std::shared_ptr<Aidl::IVibrator>>(std::move(status),
+                                                                              vibrator);
     };
     auto result = reconnectFn();
     if (!result.isOk()) {
@@ -88,16 +101,18 @@ std::shared_ptr<HalWrapper> AidlManagerHalWrapper::connectToVibrator(
     if (!vibrator) {
         return nullptr;
     }
-    return std::move(std::make_unique<AidlHalWrapper>(std::move(callbackScheduler),
-                                                      std::move(vibrator), reconnectFn));
+    return std::make_unique<AidlHalWrapper>(std::move(callbackScheduler), std::move(vibrator),
+                                            reconnectFn);
 }
 
 HalResult<void> AidlManagerHalWrapper::ping() {
-    return HalResult<void>::fromStatus(IInterface::asBinder(getHal())->pingBinder());
+    return HalResultFactory::fromStatus(AIBinder_ping(getHal()->asBinder().get()));
 }
 
 void AidlManagerHalWrapper::tryReconnect() {
-    sp<Aidl::IVibratorManager> newHandle = checkVintfService<Aidl::IVibratorManager>();
+    auto aidlServiceName = std::string(Aidl::IVibratorManager::descriptor) + "/default";
+    std::shared_ptr<Aidl::IVibratorManager> newHandle = Aidl::IVibratorManager::fromBinder(
+            ndk::SpAIBinder(AServiceManager_checkService(aidlServiceName.c_str())));
     if (newHandle) {
         std::lock_guard<std::mutex> lock(mHandleMutex);
         mHandle = std::move(newHandle);
@@ -111,9 +126,9 @@ HalResult<ManagerCapabilities> AidlManagerHalWrapper::getCapabilities() {
         return HalResult<ManagerCapabilities>::ok(*mCapabilities);
     }
     int32_t cap = 0;
-    auto result = getHal()->getCapabilities(&cap);
-    auto ret = HalResult<ManagerCapabilities>::fromStatus(result,
-                                                          static_cast<ManagerCapabilities>(cap));
+    auto status = getHal()->getCapabilities(&cap);
+    auto capabilities = static_cast<ManagerCapabilities>(cap);
+    auto ret = HalResultFactory::fromStatus<ManagerCapabilities>(std::move(status), capabilities);
     if (ret.isOk()) {
         // Cache copy of returned value.
         mCapabilities.emplace(ret.value());
@@ -128,8 +143,8 @@ HalResult<std::vector<int32_t>> AidlManagerHalWrapper::getVibratorIds() {
         return HalResult<std::vector<int32_t>>::ok(*mVibratorIds);
     }
     std::vector<int32_t> ids;
-    auto result = getHal()->getVibratorIds(&ids);
-    auto ret = HalResult<std::vector<int32_t>>::fromStatus(result, ids);
+    auto status = getHal()->getVibratorIds(&ids);
+    auto ret = HalResultFactory::fromStatus<std::vector<int32_t>>(std::move(status), ids);
     if (ret.isOk()) {
         // Cache copy of returned value and the individual controllers.
         mVibratorIds.emplace(ret.value());
@@ -152,12 +167,12 @@ HalResult<std::shared_ptr<HalController>> AidlManagerHalWrapper::getVibrator(int
     if (it != mVibrators.end()) {
         return HalResult<std::shared_ptr<HalController>>::ok(it->second);
     }
-    return HalResult<std::shared_ptr<HalController>>::failed(MISSING_VIBRATOR_MESSAGE_PREFIX +
-                                                             std::to_string(id));
+    return HalResult<std::shared_ptr<HalController>>::failed(
+            (MISSING_VIBRATOR_MESSAGE_PREFIX + std::to_string(id)).c_str());
 }
 
 HalResult<void> AidlManagerHalWrapper::prepareSynced(const std::vector<int32_t>& ids) {
-    auto ret = HalResult<void>::fromStatus(getHal()->prepareSynced(ids));
+    auto ret = HalResultFactory::fromStatus(getHal()->prepareSynced(ids));
     if (ret.isOk()) {
         // Force reload of all vibrator controllers that were prepared for a sync operation here.
         // This will trigger calls to getVibrator(id) on each controller, so they can use the
@@ -178,12 +193,24 @@ HalResult<void> AidlManagerHalWrapper::triggerSynced(
     HalResult<ManagerCapabilities> capabilities = getCapabilities();
     bool supportsCallback = capabilities.isOk() &&
             static_cast<int32_t>(capabilities.value() & ManagerCapabilities::TRIGGER_CALLBACK);
-    auto cb = supportsCallback ? new HalCallbackWrapper(completionCallback) : nullptr;
-    return HalResult<void>::fromStatus(getHal()->triggerSynced(cb));
+    auto cb = supportsCallback ? ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback)
+                               : nullptr;
+    return HalResultFactory::fromStatus(getHal()->triggerSynced(cb));
+}
+
+HalResult<std::shared_ptr<Aidl::IVibrationSession>> AidlManagerHalWrapper::startSession(
+        const std::vector<int32_t>& ids, const Aidl::VibrationSessionConfig& config,
+        const std::function<void()>& completionCallback) {
+    auto cb = ndk::SharedRefBase::make<HalCallbackWrapper>(completionCallback);
+    std::shared_ptr<Aidl::IVibrationSession> session;
+    auto status = getHal()->startSession(ids, config, cb, &session);
+    return HalResultFactory::fromStatus<std::shared_ptr<Aidl::IVibrationSession>>(std::move(status),
+                                                                                  std::move(
+                                                                                          session));
 }
 
 HalResult<void> AidlManagerHalWrapper::cancelSynced() {
-    auto ret = HalResult<void>::fromStatus(getHal()->cancelSynced());
+    auto ret = HalResultFactory::fromStatus(getHal()->cancelSynced());
     if (ret.isOk()) {
         // Force reload of all vibrator controllers that were prepared for a sync operation before.
         // This will trigger calls to getVibrator(id) on each controller, so they can use the
@@ -196,7 +223,11 @@ HalResult<void> AidlManagerHalWrapper::cancelSynced() {
     return ret;
 }
 
-sp<Aidl::IVibratorManager> AidlManagerHalWrapper::getHal() {
+HalResult<void> AidlManagerHalWrapper::clearSessions() {
+    return HalResultFactory::fromStatus(getHal()->clearSessions());
+}
+
+std::shared_ptr<Aidl::IVibratorManager> AidlManagerHalWrapper::getHal() {
     std::lock_guard<std::mutex> lock(mHandleMutex);
     return mHandle;
 }

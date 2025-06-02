@@ -52,11 +52,11 @@
 namespace android {
 
 // Macros for including the GLConsumer name in log messages
-#define GLC_LOGV(x, ...) ALOGV("[%s] " x, mName.string(), ##__VA_ARGS__)
-#define GLC_LOGD(x, ...) ALOGD("[%s] " x, mName.string(), ##__VA_ARGS__)
-//#define GLC_LOGI(x, ...) ALOGI("[%s] " x, mName.string(), ##__VA_ARGS__)
-#define GLC_LOGW(x, ...) ALOGW("[%s] " x, mName.string(), ##__VA_ARGS__)
-#define GLC_LOGE(x, ...) ALOGE("[%s] " x, mName.string(), ##__VA_ARGS__)
+#define GLC_LOGV(x, ...) ALOGV("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+#define GLC_LOGD(x, ...) ALOGD("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+// #define GLC_LOGI(x, ...) ALOGI("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+#define GLC_LOGW(x, ...) ALOGW("[%s] " x, mName.c_str(), ##__VA_ARGS__)
+#define GLC_LOGE(x, ...) ALOGE("[%s] " x, mName.c_str(), ##__VA_ARGS__)
 
 static const struct {
     uint32_t width, height;
@@ -101,6 +101,34 @@ static bool hasEglProtectedContent() {
     return hasIt;
 }
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+GLConsumer::GLConsumer(uint32_t tex, uint32_t texTarget, bool useFenceSync, bool isControlledByApp)
+      : ConsumerBase(isControlledByApp, /* isConsumerSurfaceFlinger */ false),
+        mCurrentCrop(Rect::EMPTY_RECT),
+        mCurrentTransform(0),
+        mCurrentScalingMode(NATIVE_WINDOW_SCALING_MODE_FREEZE),
+        mCurrentFence(Fence::NO_FENCE),
+        mCurrentTimestamp(0),
+        mCurrentDataSpace(HAL_DATASPACE_UNKNOWN),
+        mCurrentFrameNumber(0),
+        mDefaultWidth(1),
+        mDefaultHeight(1),
+        mFilteringEnabled(true),
+        mTexName(tex),
+        mUseFenceSync(useFenceSync),
+        mTexTarget(texTarget),
+        mEglDisplay(EGL_NO_DISPLAY),
+        mEglContext(EGL_NO_CONTEXT),
+        mCurrentTexture(BufferQueue::INVALID_BUFFER_SLOT),
+        mAttached(true) {
+    GLC_LOGV("GLConsumer");
+
+    memcpy(mCurrentTransformMatrix, mtxIdentity.asArray(), sizeof(mCurrentTransformMatrix));
+
+    mConsumer->setConsumerUsageBits(DEFAULT_USAGE_FLAGS);
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+
 GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex,
         uint32_t texTarget, bool useFenceSync, bool isControlledByApp) :
     ConsumerBase(bq, isControlledByApp),
@@ -130,27 +158,54 @@ GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex,
     mConsumer->setConsumerUsageBits(DEFAULT_USAGE_FLAGS);
 }
 
-GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t texTarget,
-        bool useFenceSync, bool isControlledByApp) :
-    ConsumerBase(bq, isControlledByApp),
-    mCurrentCrop(Rect::EMPTY_RECT),
-    mCurrentTransform(0),
-    mCurrentScalingMode(NATIVE_WINDOW_SCALING_MODE_FREEZE),
-    mCurrentFence(Fence::NO_FENCE),
-    mCurrentTimestamp(0),
-    mCurrentDataSpace(HAL_DATASPACE_UNKNOWN),
-    mCurrentFrameNumber(0),
-    mDefaultWidth(1),
-    mDefaultHeight(1),
-    mFilteringEnabled(true),
-    mTexName(0),
-    mUseFenceSync(useFenceSync),
-    mTexTarget(texTarget),
-    mEglDisplay(EGL_NO_DISPLAY),
-    mEglContext(EGL_NO_CONTEXT),
-    mCurrentTexture(BufferQueue::INVALID_BUFFER_SLOT),
-    mAttached(false)
-{
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+GLConsumer::GLConsumer(uint32_t texTarget, bool useFenceSync, bool isControlledByApp)
+      : ConsumerBase(isControlledByApp, /* isConsumerSurfaceFlinger */ false),
+        mCurrentCrop(Rect::EMPTY_RECT),
+        mCurrentTransform(0),
+        mCurrentScalingMode(NATIVE_WINDOW_SCALING_MODE_FREEZE),
+        mCurrentFence(Fence::NO_FENCE),
+        mCurrentTimestamp(0),
+        mCurrentDataSpace(HAL_DATASPACE_UNKNOWN),
+        mCurrentFrameNumber(0),
+        mDefaultWidth(1),
+        mDefaultHeight(1),
+        mFilteringEnabled(true),
+        mTexName(0),
+        mUseFenceSync(useFenceSync),
+        mTexTarget(texTarget),
+        mEglDisplay(EGL_NO_DISPLAY),
+        mEglContext(EGL_NO_CONTEXT),
+        mCurrentTexture(BufferQueue::INVALID_BUFFER_SLOT),
+        mAttached(false) {
+    GLC_LOGV("GLConsumer");
+
+    memcpy(mCurrentTransformMatrix, mtxIdentity.asArray(), sizeof(mCurrentTransformMatrix));
+
+    mConsumer->setConsumerUsageBits(DEFAULT_USAGE_FLAGS);
+}
+#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_CONSUMER_BASE_OWNS_BQ)
+
+GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t texTarget, bool useFenceSync,
+                       bool isControlledByApp)
+      : ConsumerBase(bq, isControlledByApp),
+        mCurrentCrop(Rect::EMPTY_RECT),
+        mCurrentTransform(0),
+        mCurrentScalingMode(NATIVE_WINDOW_SCALING_MODE_FREEZE),
+        mCurrentFence(Fence::NO_FENCE),
+        mCurrentTimestamp(0),
+        mCurrentDataSpace(HAL_DATASPACE_UNKNOWN),
+        mCurrentFrameNumber(0),
+        mDefaultWidth(1),
+        mDefaultHeight(1),
+        mFilteringEnabled(true),
+        mTexName(0),
+        mUseFenceSync(useFenceSync),
+        mTexTarget(texTarget),
+        mEglDisplay(EGL_NO_DISPLAY),
+        mEglContext(EGL_NO_CONTEXT),
+        mCurrentTexture(BufferQueue::INVALID_BUFFER_SLOT),
+        mAttached(false) {
     GLC_LOGV("GLConsumer");
 
     memcpy(mCurrentTransformMatrix, mtxIdentity.asArray(),
@@ -259,7 +314,7 @@ status_t GLConsumer::releaseTexImage() {
             // so... basically, nothing more to do here.
         }
 
-        err = releaseBufferLocked(buf, mSlots[buf].mGraphicBuffer, mEglDisplay, EGL_NO_SYNC_KHR);
+        err = releaseBufferLocked(buf, mSlots[buf].mGraphicBuffer);
         if (err < NO_ERROR) {
             GLC_LOGE("releaseTexImage: failed to release buffer: %s (%d)",
                     strerror(-err), err);
@@ -363,16 +418,14 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferItem& item,
     if (!mAttached) {
         GLC_LOGE("updateAndRelease: GLConsumer is not attached to an OpenGL "
                 "ES context");
-        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer,
-                mEglDisplay, EGL_NO_SYNC_KHR);
+        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer);
         return INVALID_OPERATION;
     }
 
     // Confirm state.
     err = checkAndUpdateEglStateLocked();
     if (err != NO_ERROR) {
-        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer,
-                mEglDisplay, EGL_NO_SYNC_KHR);
+        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer);
         return err;
     }
 
@@ -385,8 +438,7 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferItem& item,
     if (err != NO_ERROR) {
         GLC_LOGW("updateAndRelease: unable to createImage on display=%p slot=%d",
                 mEglDisplay, slot);
-        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer,
-                mEglDisplay, EGL_NO_SYNC_KHR);
+        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer);
         return UNKNOWN_ERROR;
     }
 
@@ -398,8 +450,7 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferItem& item,
             // release the old buffer, so instead we just drop the new frame.
             // As we are still under lock since acquireBuffer, it is safe to
             // release by slot.
-            releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer,
-                    mEglDisplay, EGL_NO_SYNC_KHR);
+            releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer);
             return err;
         }
     }

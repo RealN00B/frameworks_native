@@ -27,36 +27,42 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/result-gmock.h>
-#include <android-base/result.h>
-#include <android-base/scopeguard.h>
-#include <android-base/strings.h>
-#include <android-base/unique_fd.h>
 #include <binder/Binder.h>
 #include <binder/BpBinder.h>
+#include <binder/Functional.h>
 #include <binder/IBinder.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 #include <binder/RpcServer.h>
 #include <binder/RpcSession.h>
+#include <binder/Status.h>
+#include <binder/unique_fd.h>
+#include <input/BlockingQueue.h>
+#include <processgroup/processgroup.h>
+#include <utils/Flattenable.h>
+#include <utils/SystemClock.h>
 
 #include <linux/sched.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include "../Utils.h"
 #include "../binder_module.h"
-#include "binderAbiHelper.h"
-
-#define ARRAY_SIZE(array) (sizeof array / sizeof array[0])
 
 using namespace android;
+using namespace android::binder::impl;
 using namespace std::string_literals;
 using namespace std::chrono_literals;
 using android::base::testing::HasValue;
-using android::base::testing::Ok;
+using android::binder::Status;
+using android::binder::unique_fd;
+using std::chrono_literals::operator""ms;
 using testing::ExplainMatchResult;
 using testing::Matcher;
 using testing::Not;
@@ -69,7 +75,7 @@ MATCHER_P(StatusEq, expected, (negation ? "not " : "") + statusToString(expected
 }
 
 static ::testing::AssertionResult IsPageAligned(void *buf) {
-    if (((unsigned long)buf & ((unsigned long)PAGE_SIZE - 1)) == 0)
+    if (((unsigned long)buf & ((unsigned long)getpagesize() - 1)) == 0)
         return ::testing::AssertionSuccess();
     else
         return ::testing::AssertionFailure() << buf << " is not page aligned";
@@ -83,7 +89,7 @@ static char binderserverarg[] = "--binderserver";
 static constexpr int kSchedPolicy = SCHED_RR;
 static constexpr int kSchedPriority = 7;
 static constexpr int kSchedPriorityMore = 8;
-static constexpr int kKernelThreads = 15;
+static constexpr int kKernelThreads = 17; // anything different than the default
 
 static String16 binderLibTestServiceName = String16("test.binderLib");
 
@@ -106,6 +112,8 @@ enum BinderLibTestTranscationCode {
     BINDER_LIB_TEST_LINK_DEATH_TRANSACTION,
     BINDER_LIB_TEST_WRITE_FILE_TRANSACTION,
     BINDER_LIB_TEST_WRITE_PARCEL_FILE_DESCRIPTOR_TRANSACTION,
+    BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_OWNED_TRANSACTION,
+    BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_UNOWNED_TRANSACTION,
     BINDER_LIB_TEST_EXIT_TRANSACTION,
     BINDER_LIB_TEST_DELAYED_EXIT_TRANSACTION,
     BINDER_LIB_TEST_GET_PTR_SIZE_TRANSACTION,
@@ -114,6 +122,9 @@ enum BinderLibTestTranscationCode {
     BINDER_LIB_TEST_GET_SCHEDULING_POLICY,
     BINDER_LIB_TEST_NOP_TRANSACTION_WAIT,
     BINDER_LIB_TEST_GETPID,
+    BINDER_LIB_TEST_GETUID,
+    BINDER_LIB_TEST_LISTEN_FOR_FROZEN_STATE_CHANGE,
+    BINDER_LIB_TEST_CONSUME_STATE_CHANGE_EVENTS,
     BINDER_LIB_TEST_ECHO_VECTOR,
     BINDER_LIB_TEST_GET_NON_BLOCKING_FD,
     BINDER_LIB_TEST_REJECT_OBJECTS,
@@ -213,8 +224,12 @@ class BinderLibTestEnv : public ::testing::Environment {
             ASSERT_GT(m_serverpid, 0);
 
             sp<IServiceManager> sm = defaultServiceManager();
+            // disable caching during addService.
+            sm->enableAddServiceCache(false);
             //printf("%s: pid %d, get service\n", __func__, m_pid);
+            LIBBINDER_IGNORE("-Wdeprecated-declarations")
             m_server = sm->getService(binderLibTestServiceName);
+            LIBBINDER_IGNORE_END()
             ASSERT_TRUE(m_server != nullptr);
             //printf("%s: pid %d, get service done\n", __func__, m_pid);
         }
@@ -244,11 +259,51 @@ class BinderLibTestEnv : public ::testing::Environment {
         sp<IBinder> m_server;
 };
 
+class TestFrozenStateChangeCallback : public IBinder::FrozenStateChangeCallback {
+public:
+    BlockingQueue<std::pair<const wp<IBinder>, State>> events;
+
+    virtual void onStateChanged(const wp<IBinder>& who, State state) {
+        events.push(std::make_pair(who, state));
+    }
+
+    void ensureFrozenEventReceived() {
+        auto event = events.popWithTimeout(500ms);
+        ASSERT_TRUE(event.has_value());
+        EXPECT_EQ(State::FROZEN, event->second); // isFrozen should be true
+        EXPECT_EQ(0u, events.size());
+    }
+
+    void ensureUnfrozenEventReceived() {
+        auto event = events.popWithTimeout(500ms);
+        ASSERT_TRUE(event.has_value());
+        EXPECT_EQ(State::UNFROZEN, event->second); // isFrozen should be false
+        EXPECT_EQ(0u, events.size());
+    }
+
+    std::vector<bool> getAllAndClear() {
+        std::vector<bool> results;
+        while (true) {
+            auto event = events.popWithTimeout(0ms);
+            if (!event.has_value()) {
+                break;
+            }
+            results.push_back(event->second == State::FROZEN);
+        }
+        return results;
+    }
+
+    sp<IBinder> binder;
+};
+
 class BinderLibTest : public ::testing::Test {
     public:
         virtual void SetUp() {
             m_server = static_cast<BinderLibTestEnv *>(binder_env)->getServer();
-            IPCThreadState::self()->restoreCallingWorkSource(0); 
+            IPCThreadState::self()->restoreCallingWorkSource(0);
+            sp<IServiceManager> sm = defaultServiceManager();
+            // disable caching during addService.
+            sm->enableAddServiceCache(false);
         }
         virtual void TearDown() {
         }
@@ -286,6 +341,51 @@ class BinderLibTest : public ::testing::Test {
             pfd.events = POLLIN;
             ret = poll(&pfd, 1, timeout_ms);
             EXPECT_EQ(1, ret);
+        }
+
+        bool checkFreezeSupport() {
+            std::ifstream freezer_file("/sys/fs/cgroup/uid_0/cgroup.freeze");
+            // Pass test on devices where the cgroup v2 freezer is not supported
+            if (freezer_file.fail()) {
+                return false;
+            }
+            return IPCThreadState::self()->freeze(getpid(), false, 0) == NO_ERROR;
+        }
+
+        bool checkFreezeAndNotificationSupport() {
+            if (!checkFreezeSupport()) {
+                return false;
+            }
+            return ProcessState::isDriverFeatureEnabled(
+                    ProcessState::DriverFeature::FREEZE_NOTIFICATION);
+        }
+
+        bool getBinderPid(int32_t* pid, sp<IBinder> server) {
+            Parcel data, replypid;
+            if (server->transact(BINDER_LIB_TEST_GETPID, data, &replypid) != NO_ERROR) {
+                ALOGE("BINDER_LIB_TEST_GETPID failed");
+                return false;
+            }
+            *pid = replypid.readInt32();
+            if (*pid <= 0) {
+                ALOGE("pid should be greater than zero");
+                return false;
+            }
+            return true;
+        }
+
+        void freezeProcess(int32_t pid) {
+            EXPECT_EQ(NO_ERROR, IPCThreadState::self()->freeze(pid, true, 1000));
+        }
+
+        void unfreezeProcess(int32_t pid) {
+            EXPECT_EQ(NO_ERROR, IPCThreadState::self()->freeze(pid, false, 0));
+        }
+
+        void removeCallbackAndValidateNoEvent(sp<IBinder> binder,
+                                              sp<TestFrozenStateChangeCallback> callback) {
+            EXPECT_THAT(binder->removeFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+            EXPECT_EQ(0u, callback->events.size());
         }
 
         sp<IBinder> m_server;
@@ -445,6 +545,30 @@ class TestDeathRecipient : public IBinder::DeathRecipient, public BinderLibTestE
         };
 };
 
+ssize_t countFds() {
+    return std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                         std::filesystem::directory_iterator{});
+}
+
+struct FdLeakDetector {
+    int startCount;
+
+    FdLeakDetector() {
+        // This log statement is load bearing. We have to log something before
+        // counting FDs to make sure the logging system is initialized, otherwise
+        // the sockets it opens will look like a leak.
+        ALOGW("FdLeakDetector counting FDs.");
+        startCount = countFds();
+    }
+    ~FdLeakDetector() {
+        int endCount = countFds();
+        if (startCount != endCount) {
+            ADD_FAILURE() << "fd count changed (" << startCount << " -> " << endCount
+                          << ") fd leak?";
+        }
+    }
+};
+
 TEST_F(BinderLibTest, CannotUseBinderAfterFork) {
     // EXPECT_DEATH works by forking the process
     EXPECT_DEATH({ ProcessState::self(); }, "libbinder ProcessState can not be used after fork");
@@ -454,6 +578,35 @@ TEST_F(BinderLibTest, AddManagerToManager) {
     sp<IServiceManager> sm = defaultServiceManager();
     sp<IBinder> binder = IInterface::asBinder(sm);
     EXPECT_EQ(NO_ERROR, sm->addService(String16("binderLibTest-manager"), binder));
+}
+
+TEST_F(BinderLibTest, RegisterForNotificationsFailure) {
+    auto sm = defaultServiceManager();
+    using LocalRegistrationCallback = IServiceManager::LocalRegistrationCallback;
+    class LocalRegistrationCallbackImpl : public virtual LocalRegistrationCallback {
+        void onServiceRegistration(const String16&, const sp<IBinder>&) override {}
+        virtual ~LocalRegistrationCallbackImpl() {}
+    };
+    sp<LocalRegistrationCallback> cb = sp<LocalRegistrationCallbackImpl>::make();
+
+    EXPECT_EQ(BAD_VALUE, sm->registerForNotifications(String16("ValidName"), nullptr));
+    EXPECT_EQ(UNKNOWN_ERROR, sm->registerForNotifications(String16("InvalidName!$"), cb));
+}
+
+TEST_F(BinderLibTest, UnregisterForNotificationsFailure) {
+    auto sm = defaultServiceManager();
+    using LocalRegistrationCallback = IServiceManager::LocalRegistrationCallback;
+    class LocalRegistrationCallbackImpl : public virtual LocalRegistrationCallback {
+        void onServiceRegistration(const String16&, const sp<IBinder>&) override {}
+        virtual ~LocalRegistrationCallbackImpl() {}
+    };
+    sp<LocalRegistrationCallback> cb = sp<LocalRegistrationCallbackImpl>::make();
+
+    EXPECT_EQ(OK, sm->registerForNotifications(String16("ValidName"), cb));
+
+    EXPECT_EQ(BAD_VALUE, sm->unregisterForNotifications(String16("ValidName"), nullptr));
+    EXPECT_EQ(BAD_VALUE, sm->unregisterForNotifications(String16("AnotherValidName"), cb));
+    EXPECT_EQ(BAD_VALUE, sm->unregisterForNotifications(String16("InvalidName!!!"), cb));
 }
 
 TEST_F(BinderLibTest, WasParceled) {
@@ -484,30 +637,26 @@ TEST_F(BinderLibTest, NopTransactionClear) {
 }
 
 TEST_F(BinderLibTest, Freeze) {
-    Parcel data, reply, replypid;
-    std::ifstream freezer_file("/sys/fs/cgroup/uid_0/cgroup.freeze");
-
-    // Pass test on devices where the cgroup v2 freezer is not supported
-    if (freezer_file.fail()) {
-        GTEST_SKIP();
+    if (!checkFreezeSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support proceess freezing";
         return;
     }
-
+    Parcel data, reply, replypid;
     EXPECT_THAT(m_server->transact(BINDER_LIB_TEST_GETPID, data, &replypid), StatusEq(NO_ERROR));
     int32_t pid = replypid.readInt32();
     for (int i = 0; i < 10; i++) {
         EXPECT_EQ(NO_ERROR, m_server->transact(BINDER_LIB_TEST_NOP_TRANSACTION_WAIT, data, &reply, TF_ONE_WAY));
     }
 
-    // Pass test on devices where BINDER_FREEZE ioctl is not supported
-    int ret = IPCThreadState::self()->freeze(pid, false, 0);
-    if (ret != 0) {
-        GTEST_SKIP();
-        return;
+    EXPECT_EQ(NO_ERROR, IPCThreadState::self()->freeze(pid, false, 0));
+    EXPECT_EQ(-EAGAIN, IPCThreadState::self()->freeze(pid, true, 0));
+
+    // b/268232063 - succeeds ~0.08% of the time
+    {
+        auto ret = IPCThreadState::self()->freeze(pid, true, 0);
+        EXPECT_TRUE(ret == -EAGAIN || ret == OK);
     }
 
-    EXPECT_EQ(-EAGAIN, IPCThreadState::self()->freeze(pid, true, 0));
-    EXPECT_EQ(-EAGAIN, IPCThreadState::self()->freeze(pid, true, 0));
     EXPECT_EQ(NO_ERROR, IPCThreadState::self()->freeze(pid, true, 1000));
     EXPECT_EQ(FAILED_TRANSACTION, m_server->transact(BINDER_LIB_TEST_NOP_TRANSACTION, data, &reply));
 
@@ -516,8 +665,8 @@ TEST_F(BinderLibTest, Freeze) {
     EXPECT_EQ(NO_ERROR, IPCThreadState::self()->getProcessFreezeInfo(pid, &sync_received,
                 &async_received));
 
-    EXPECT_EQ(sync_received, 1);
-    EXPECT_EQ(async_received, 0);
+    EXPECT_EQ(sync_received, 1u);
+    EXPECT_EQ(async_received, 0u);
 
     EXPECT_EQ(NO_ERROR, IPCThreadState::self()->freeze(pid, false, 0));
     EXPECT_EQ(NO_ERROR, m_server->transact(BINDER_LIB_TEST_NOP_TRANSACTION, data, &reply));
@@ -525,7 +674,7 @@ TEST_F(BinderLibTest, Freeze) {
 
 TEST_F(BinderLibTest, SetError) {
     int32_t testValue[] = { 0, -123, 123 };
-    for (size_t i = 0; i < ARRAY_SIZE(testValue); i++) {
+    for (size_t i = 0; i < countof(testValue); i++) {
         Parcel data, reply;
         data.writeInt32(testValue[i]);
         EXPECT_THAT(m_server->transact(BINDER_LIB_TEST_SET_ERROR_TRANSACTION, data, &reply),
@@ -556,8 +705,8 @@ TEST_F(BinderLibTest, IndirectGetId2)
     Parcel data, reply;
     int32_t serverId[3];
 
-    data.writeInt32(ARRAY_SIZE(serverId));
-    for (size_t i = 0; i < ARRAY_SIZE(serverId); i++) {
+    data.writeInt32(countof(serverId));
+    for (size_t i = 0; i < countof(serverId); i++) {
         sp<IBinder> server;
         BinderLibTestBundle datai;
 
@@ -575,7 +724,7 @@ TEST_F(BinderLibTest, IndirectGetId2)
     EXPECT_EQ(0, id);
 
     ASSERT_THAT(reply.readInt32(&count), StatusEq(NO_ERROR));
-    EXPECT_EQ(ARRAY_SIZE(serverId), (size_t)count);
+    EXPECT_EQ(countof(serverId), (size_t)count);
 
     for (size_t i = 0; i < (size_t)count; i++) {
         BinderLibTestBundle replyi(&reply);
@@ -595,8 +744,8 @@ TEST_F(BinderLibTest, IndirectGetId3)
     Parcel data, reply;
     int32_t serverId[3];
 
-    data.writeInt32(ARRAY_SIZE(serverId));
-    for (size_t i = 0; i < ARRAY_SIZE(serverId); i++) {
+    data.writeInt32(countof(serverId));
+    for (size_t i = 0; i < countof(serverId); i++) {
         sp<IBinder> server;
         BinderLibTestBundle datai;
         BinderLibTestBundle datai2;
@@ -621,7 +770,7 @@ TEST_F(BinderLibTest, IndirectGetId3)
     EXPECT_EQ(0, id);
 
     ASSERT_THAT(reply.readInt32(&count), StatusEq(NO_ERROR));
-    EXPECT_EQ(ARRAY_SIZE(serverId), (size_t)count);
+    EXPECT_EQ(countof(serverId), (size_t)count);
 
     for (size_t i = 0; i < (size_t)count; i++) {
         int32_t counti;
@@ -796,6 +945,199 @@ TEST_F(BinderLibTest, DeathNotificationThread)
     EXPECT_THAT(callback->getResult(), StatusEq(NO_ERROR));
 }
 
+TEST_F(BinderLibTest, ReturnErrorIfKernelDoesNotSupportFreezeNotification) {
+    if (ProcessState::isDriverFeatureEnabled(ProcessState::DriverFeature::FREEZE_NOTIFICATION)) {
+        GTEST_SKIP() << "Skipping test for kernels that support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    ASSERT_EQ(nullptr, binder->localBinder());
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(INVALID_OPERATION));
+}
+
+TEST_F(BinderLibTest, FrozenStateChangeNotificatiion) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    int32_t pid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+    // Expect current state (unfrozen) to be delivered immediately.
+    callback->ensureUnfrozenEventReceived();
+    // Check that the process hasn't died otherwise there's a risk of freezing
+    // the wrong process.
+    EXPECT_EQ(OK, binder->pingBinder());
+    freezeProcess(pid);
+    callback->ensureFrozenEventReceived();
+    unfreezeProcess(pid);
+    callback->ensureUnfrozenEventReceived();
+    removeCallbackAndValidateNoEvent(binder, callback);
+}
+
+TEST_F(BinderLibTest, AddFrozenCallbackWhenFrozen) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    int32_t pid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+
+    // Check that the process hasn't died otherwise there's a risk of freezing
+    // the wrong process.
+    EXPECT_EQ(OK, binder->pingBinder());
+    freezeProcess(pid);
+    // Add the callback while the target process is frozen.
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+    callback->ensureFrozenEventReceived();
+    unfreezeProcess(pid);
+    callback->ensureUnfrozenEventReceived();
+    removeCallbackAndValidateNoEvent(binder, callback);
+
+    // Check that the process hasn't died otherwise there's a risk of freezing
+    // the wrong process.
+    EXPECT_EQ(OK, binder->pingBinder());
+    freezeProcess(pid);
+    unfreezeProcess(pid);
+    // Make sure no callback happens since the listener has been removed.
+    EXPECT_EQ(0u, callback->events.size());
+}
+
+TEST_F(BinderLibTest, NoFrozenNotificationAfterCallbackRemoval) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    int32_t pid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+    callback->ensureUnfrozenEventReceived();
+    removeCallbackAndValidateNoEvent(binder, callback);
+
+    // Make sure no callback happens after the listener is removed.
+    freezeProcess(pid);
+    unfreezeProcess(pid);
+    EXPECT_EQ(0u, callback->events.size());
+}
+
+TEST_F(BinderLibTest, MultipleFrozenStateChangeCallbacks) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback1 = sp<TestFrozenStateChangeCallback>::make();
+    sp<TestFrozenStateChangeCallback> callback2 = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    int32_t pid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback1), StatusEq(NO_ERROR));
+    // Expect current state (unfrozen) to be delivered immediately.
+    callback1->ensureUnfrozenEventReceived();
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback2), StatusEq(NO_ERROR));
+    // Expect current state (unfrozen) to be delivered immediately.
+    callback2->ensureUnfrozenEventReceived();
+
+    freezeProcess(pid);
+    callback1->ensureFrozenEventReceived();
+    callback2->ensureFrozenEventReceived();
+
+    removeCallbackAndValidateNoEvent(binder, callback1);
+    unfreezeProcess(pid);
+    EXPECT_EQ(0u, callback1->events.size());
+    callback2->ensureUnfrozenEventReceived();
+    removeCallbackAndValidateNoEvent(binder, callback2);
+
+    freezeProcess(pid);
+    EXPECT_EQ(0u, callback2->events.size());
+}
+
+TEST_F(BinderLibTest, RemoveThenAddFrozenStateChangeCallbacks) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<TestFrozenStateChangeCallback> callback = sp<TestFrozenStateChangeCallback>::make();
+    sp<IBinder> binder = addServer();
+    ASSERT_NE(nullptr, binder);
+    int32_t pid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+    // Expect current state (unfrozen) to be delivered immediately.
+    callback->ensureUnfrozenEventReceived();
+    removeCallbackAndValidateNoEvent(binder, callback);
+
+    EXPECT_THAT(binder->addFrozenStateChangeCallback(callback), StatusEq(NO_ERROR));
+    callback->ensureUnfrozenEventReceived();
+}
+
+TEST_F(BinderLibTest, CoalesceFreezeCallbacksWhenListenerIsFrozen) {
+    if (!checkFreezeAndNotificationSupport()) {
+        GTEST_SKIP() << "Skipping test for kernels that do not support FREEZE_NOTIFICATION";
+        return;
+    }
+    sp<IBinder> binder = addServer();
+    sp<IBinder> listener = addServer();
+    ASSERT_NE(nullptr, binder);
+    ASSERT_NE(nullptr, listener);
+    int32_t pid, listenerPid;
+    ASSERT_TRUE(getBinderPid(&pid, binder));
+    ASSERT_TRUE(getBinderPid(&listenerPid, listener));
+
+    // Ask the listener process to register for state change callbacks.
+    {
+        Parcel data, reply;
+        data.writeStrongBinder(binder);
+        ASSERT_THAT(listener->transact(BINDER_LIB_TEST_LISTEN_FOR_FROZEN_STATE_CHANGE, data,
+                                       &reply),
+                    StatusEq(NO_ERROR));
+    }
+    // Freeze the listener process.
+    freezeProcess(listenerPid);
+    createProcessGroup(getuid(), listenerPid);
+    ASSERT_TRUE(SetProcessProfiles(getuid(), listenerPid, {"Frozen"}));
+    // Repeatedly flip the target process between frozen and unfrozen states.
+    for (int i = 0; i < 1000; i++) {
+        usleep(50);
+        unfreezeProcess(pid);
+        usleep(50);
+        freezeProcess(pid);
+    }
+    // Unfreeze the listener process. Now it should receive the frozen state
+    // change notifications.
+    ASSERT_TRUE(SetProcessProfiles(getuid(), listenerPid, {"Unfrozen"}));
+    unfreezeProcess(listenerPid);
+    // Wait for 500ms to give the process enough time to wake up and handle
+    // notifications.
+    usleep(500 * 1000);
+    {
+        std::vector<bool> events;
+        Parcel data, reply;
+        ASSERT_THAT(listener->transact(BINDER_LIB_TEST_CONSUME_STATE_CHANGE_EVENTS, data, &reply),
+                    StatusEq(NO_ERROR));
+        reply.readBoolVector(&events);
+        // There should only be one single state change notifications delievered.
+        ASSERT_EQ(1u, events.size());
+        EXPECT_TRUE(events[0]);
+    }
+}
+
 TEST_F(BinderLibTest, PassFile) {
     int ret;
     int pipefd[2];
@@ -838,7 +1180,7 @@ TEST_F(BinderLibTest, PassParcelFileDescriptor) {
         writebuf[i] = i;
     }
 
-    android::base::unique_fd read_end, write_end;
+    unique_fd read_end, write_end;
     {
         int pipefd[2];
         ASSERT_EQ(0, pipe2(pipefd, O_NONBLOCK));
@@ -864,6 +1206,100 @@ TEST_F(BinderLibTest, PassParcelFileDescriptor) {
     waitForReadData(read_end.get(), 5000); /* wait for other proccess to close pipe */
 
     EXPECT_EQ(0, read(read_end.get(), readbuf.data(), datasize));
+}
+
+TEST_F(BinderLibTest, RecvOwnedFileDescriptors) {
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_OWNED_TRANSACTION, data,
+                                 &reply));
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&b));
+}
+
+// Used to trigger fdsan error (b/239222407).
+TEST_F(BinderLibTest, RecvOwnedFileDescriptorsAndWriteInt) {
+    GTEST_SKIP() << "triggers fdsan false positive: b/370824489";
+
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_OWNED_TRANSACTION, data,
+                                 &reply));
+    reply.setDataPosition(reply.dataSize());
+    reply.writeInt32(0);
+    reply.setDataPosition(0);
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&b));
+}
+
+// Used to trigger fdsan error (b/239222407).
+TEST_F(BinderLibTest, RecvOwnedFileDescriptorsAndTruncate) {
+    GTEST_SKIP() << "triggers fdsan false positive: b/370824489";
+
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_OWNED_TRANSACTION, data,
+                                 &reply));
+    reply.setDataSize(reply.dataSize() - sizeof(flat_binder_object));
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(BAD_TYPE, reply.readUniqueFileDescriptor(&b));
+}
+
+TEST_F(BinderLibTest, RecvUnownedFileDescriptors) {
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_UNOWNED_TRANSACTION, data,
+                                 &reply));
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&b));
+}
+
+// Used to trigger fdsan error (b/239222407).
+TEST_F(BinderLibTest, RecvUnownedFileDescriptorsAndWriteInt) {
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_UNOWNED_TRANSACTION, data,
+                                 &reply));
+    reply.setDataPosition(reply.dataSize());
+    reply.writeInt32(0);
+    reply.setDataPosition(0);
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&b));
+}
+
+// Used to trigger fdsan error (b/239222407).
+TEST_F(BinderLibTest, RecvUnownedFileDescriptorsAndTruncate) {
+    FdLeakDetector fd_leak_detector;
+
+    Parcel data;
+    Parcel reply;
+    EXPECT_EQ(NO_ERROR,
+              m_server->transact(BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_UNOWNED_TRANSACTION, data,
+                                 &reply));
+    reply.setDataSize(reply.dataSize() - sizeof(flat_binder_object));
+    unique_fd a, b;
+    EXPECT_EQ(OK, reply.readUniqueFileDescriptor(&a));
+    EXPECT_EQ(BAD_TYPE, reply.readUniqueFileDescriptor(&b));
 }
 
 TEST_F(BinderLibTest, PromoteLocal) {
@@ -1102,6 +1538,7 @@ TEST_F(BinderLibTest, WorkSourcePropagatedForAllFollowingBinderCalls)
     status_t ret;
     data.writeInterfaceToken(binderLibTestServiceName);
     ret = m_server->transact(BINDER_LIB_TEST_GET_WORK_SOURCE_TRANSACTION, data, &reply);
+    EXPECT_EQ(NO_ERROR, ret);
 
     Parcel data2, reply2;
     status_t ret2;
@@ -1167,7 +1604,7 @@ TEST_F(BinderLibTest, FileDescriptorRemainsNonBlocking) {
     Parcel reply;
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_GET_NON_BLOCKING_FD, {} /*data*/, &reply),
                 StatusEq(NO_ERROR));
-    base::unique_fd fd;
+    unique_fd fd;
     EXPECT_THAT(reply.readUniqueFileDescriptor(&fd), StatusEq(OK));
 
     const int result = fcntl(fd.get(), F_GETFL);
@@ -1225,13 +1662,13 @@ TEST_F(BinderLibTest, BufRejected) {
     data.setDataCapacity(1024);
     // Write a bogus object at offset 0 to get an entry in the offset table
     data.writeFileDescriptor(0);
-    EXPECT_EQ(data.objectsCount(), 1);
+    EXPECT_EQ(data.objectsCount(), 1u);
     uint8_t *parcelData = const_cast<uint8_t*>(data.data());
     // And now, overwrite it with the buffer object
     memcpy(parcelData, &obj, sizeof(obj));
     data.setDataSize(sizeof(obj));
 
-    EXPECT_EQ(data.objectsCount(), 1);
+    EXPECT_EQ(data.objectsCount(), 1u);
 
     // Either the kernel should reject this transaction (if it's correct), but
     // if it's not, the server implementation should return an error if it
@@ -1256,7 +1693,7 @@ TEST_F(BinderLibTest, WeakRejected) {
     data.setDataCapacity(1024);
     // Write a bogus object at offset 0 to get an entry in the offset table
     data.writeFileDescriptor(0);
-    EXPECT_EQ(data.objectsCount(), 1);
+    EXPECT_EQ(data.objectsCount(), 1u);
     uint8_t *parcelData = const_cast<uint8_t *>(data.data());
     // And now, overwrite it with the weak binder
     memcpy(parcelData, &obj, sizeof(obj));
@@ -1266,7 +1703,7 @@ TEST_F(BinderLibTest, WeakRejected) {
     // test with an object that libbinder will actually try to release
     EXPECT_EQ(OK, data.writeStrongBinder(sp<BBinder>::make()));
 
-    EXPECT_EQ(data.objectsCount(), 2);
+    EXPECT_EQ(data.objectsCount(), 2u);
 
     // send it many times, since previous error was memory corruption, make it
     // more likely that the server crashes
@@ -1316,7 +1753,7 @@ TEST_F(BinderLibTest, TooManyFdsFlattenable) {
     ASSERT_EQ(0, ret);
 
     // Restore the original file limits when the test finishes
-    base::ScopeGuard guardUnguard([&]() { setrlimit(RLIMIT_NOFILE, &origNofile); });
+    auto guardUnguard = make_scope_guard([&]() { setrlimit(RLIMIT_NOFILE, &origNofile); });
 
     rlimit testNofile = {1024, 1024};
     ret = setrlimit(RLIMIT_NOFILE, &testNofile);
@@ -1334,6 +1771,7 @@ TEST_F(BinderLibTest, TooManyFdsFlattenable) {
 
 TEST(ServiceNotifications, Unregister) {
     auto sm = defaultServiceManager();
+    sm->enableAddServiceCache(false);
     using LocalRegistrationCallback = IServiceManager::LocalRegistrationCallback;
     class LocalRegistrationCallbackImpl : public virtual LocalRegistrationCallback {
         void onServiceRegistration(const String16 &, const sp<IBinder> &) override {}
@@ -1352,17 +1790,20 @@ TEST_F(BinderLibTest, ThreadPoolAvailableThreads) {
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_GET_MAX_THREAD_COUNT, data, &reply),
                 StatusEq(NO_ERROR));
     int32_t replyi = reply.readInt32();
-    // Expect 16 threads: kKernelThreads = 15 + Pool thread == 16
-    EXPECT_TRUE(replyi == kKernelThreads || replyi == kKernelThreads + 1);
+    // see getThreadPoolMaxTotalThreadCount for why there is a race
+    EXPECT_TRUE(replyi == kKernelThreads + 1 || replyi == kKernelThreads + 2) << replyi;
+
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_PROCESS_LOCK, data, &reply), NO_ERROR);
 
     /*
-     * This will use all threads in the pool expect the main pool thread.
-     * The service should run fine without locking, and the thread count should
-     * not exceed 16 (15 Max + pool thread).
+     * This will use all threads in the pool but one. There are actually kKernelThreads+2
+     * available in the other process (startThreadPool, joinThreadPool, + the kernel-
+     * started threads from setThreadPoolMaxThreadCount
+     *
+     * Adding one more will cause it to deadlock.
      */
     std::vector<std::thread> ts;
-    for (size_t i = 0; i < kKernelThreads; i++) {
+    for (size_t i = 0; i < kKernelThreads + 1; i++) {
         ts.push_back(std::thread([&] {
             Parcel local_reply;
             EXPECT_THAT(server->transact(BINDER_LIB_TEST_LOCK_UNLOCK, data, &local_reply),
@@ -1370,8 +1811,13 @@ TEST_F(BinderLibTest, ThreadPoolAvailableThreads) {
         }));
     }
 
-    data.writeInt32(100);
-    // Give a chance for all threads to be used
+    // make sure all of the above calls will be queued in parallel. Otherwise, most of
+    // the time, the below call will pre-empt them (presumably because we have the
+    // scheduler timeslice already + scheduler hint).
+    sleep(1);
+
+    data.writeInt32(1000);
+    // Give a chance for all threads to be used (kKernelThreads + 1 thread in use)
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_UNLOCK_AFTER_MS, data, &reply), NO_ERROR);
 
     for (auto &t : ts) {
@@ -1381,7 +1827,7 @@ TEST_F(BinderLibTest, ThreadPoolAvailableThreads) {
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_GET_MAX_THREAD_COUNT, data, &reply),
                 StatusEq(NO_ERROR));
     replyi = reply.readInt32();
-    EXPECT_EQ(replyi, kKernelThreads + 1);
+    EXPECT_EQ(replyi, kKernelThreads + 2);
 }
 
 TEST_F(BinderLibTest, ThreadPoolStarted) {
@@ -1392,23 +1838,17 @@ TEST_F(BinderLibTest, ThreadPoolStarted) {
     EXPECT_TRUE(reply.readBool());
 }
 
-size_t epochMillis() {
-    using std::chrono::duration_cast;
-    using std::chrono::milliseconds;
-    using std::chrono::seconds;
-    using std::chrono::system_clock;
-    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-}
-
 TEST_F(BinderLibTest, HangingServices) {
     Parcel data, reply;
     sp<IBinder> server = addServer();
     ASSERT_TRUE(server != nullptr);
     int32_t delay = 1000; // ms
     data.writeInt32(delay);
+    // b/266537959 - must take before taking lock, since countdown is started in the remote
+    // process there.
+    int64_t timeBefore = uptimeMillis();
     EXPECT_THAT(server->transact(BINDER_LIB_TEST_PROCESS_TEMPORARY_LOCK, data, &reply), NO_ERROR);
     std::vector<std::thread> ts;
-    size_t epochMsBefore = epochMillis();
     for (size_t i = 0; i < kKernelThreads + 1; i++) {
         ts.push_back(std::thread([&] {
             Parcel local_reply;
@@ -1420,10 +1860,120 @@ TEST_F(BinderLibTest, HangingServices) {
     for (auto &t : ts) {
         t.join();
     }
-    size_t epochMsAfter = epochMillis();
+    int64_t timeAfter = uptimeMillis();
 
     // deadlock occurred and threads only finished after 1s passed.
-    EXPECT_GE(epochMsAfter, epochMsBefore + delay);
+    EXPECT_GE(timeAfter, timeBefore + delay);
+}
+
+TEST_F(BinderLibTest, BinderProxyCount) {
+    Parcel data, reply;
+    sp<IBinder> server = addServer();
+    ASSERT_NE(server, nullptr);
+
+    uint32_t initialCount = BpBinder::getBinderProxyCount();
+    size_t iterations = 100;
+    {
+        uint32_t count = initialCount;
+        std::vector<sp<IBinder> > proxies;
+        sp<IBinder> proxy;
+        // Create binder proxies and verify the count.
+        for (size_t i = 0; i < iterations; i++) {
+            ASSERT_THAT(server->transact(BINDER_LIB_TEST_CREATE_BINDER_TRANSACTION, data, &reply),
+                        StatusEq(NO_ERROR));
+            proxies.push_back(reply.readStrongBinder());
+            EXPECT_EQ(BpBinder::getBinderProxyCount(), ++count);
+        }
+        // Remove every other one and verify the count.
+        auto it = proxies.begin();
+        for (size_t i = 0; it != proxies.end(); i++) {
+            if (i % 2 == 0) {
+                it = proxies.erase(it);
+                EXPECT_EQ(BpBinder::getBinderProxyCount(), --count);
+            }
+        }
+    }
+    EXPECT_EQ(BpBinder::getBinderProxyCount(), initialCount);
+}
+
+static constexpr int kBpCountHighWatermark = 20;
+static constexpr int kBpCountLowWatermark = 10;
+static constexpr int kBpCountWarningWatermark = 15;
+static constexpr int kInvalidUid = -1;
+
+TEST_F(BinderLibTest, BinderProxyCountCallback) {
+    Parcel data, reply;
+    sp<IBinder> server = addServer();
+    ASSERT_NE(server, nullptr);
+
+    BpBinder::enableCountByUid();
+    EXPECT_THAT(m_server->transact(BINDER_LIB_TEST_GETUID, data, &reply), StatusEq(NO_ERROR));
+    int32_t uid = reply.readInt32();
+    ASSERT_NE(uid, kInvalidUid);
+
+    uint32_t initialCount = BpBinder::getBinderProxyCount();
+    {
+        uint32_t count = initialCount;
+        BpBinder::setBinderProxyCountWatermarks(kBpCountHighWatermark,
+                                                kBpCountLowWatermark,
+                                                kBpCountWarningWatermark);
+        int limitCallbackUid = kInvalidUid;
+        int warningCallbackUid = kInvalidUid;
+        BpBinder::setBinderProxyCountEventCallback([&](int uid) { limitCallbackUid = uid; },
+                                                   [&](int uid) { warningCallbackUid = uid; });
+
+        std::vector<sp<IBinder> > proxies;
+        auto createProxyOnce = [&](int expectedWarningCallbackUid, int expectedLimitCallbackUid) {
+            warningCallbackUid = limitCallbackUid = kInvalidUid;
+            ASSERT_THAT(server->transact(BINDER_LIB_TEST_CREATE_BINDER_TRANSACTION, data, &reply),
+                        StatusEq(NO_ERROR));
+            proxies.push_back(reply.readStrongBinder());
+            EXPECT_EQ(BpBinder::getBinderProxyCount(), ++count);
+            EXPECT_EQ(warningCallbackUid, expectedWarningCallbackUid);
+            EXPECT_EQ(limitCallbackUid, expectedLimitCallbackUid);
+        };
+        auto removeProxyOnce = [&](int expectedWarningCallbackUid, int expectedLimitCallbackUid) {
+            warningCallbackUid = limitCallbackUid = kInvalidUid;
+            proxies.pop_back();
+            EXPECT_EQ(BpBinder::getBinderProxyCount(), --count);
+            EXPECT_EQ(warningCallbackUid, expectedWarningCallbackUid);
+            EXPECT_EQ(limitCallbackUid, expectedLimitCallbackUid);
+        };
+
+        // Test the increment/decrement of the binder proxies.
+        for (int i = 1; i <= kBpCountWarningWatermark; i++) {
+            createProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(uid, kInvalidUid); // Warning callback should have been triggered.
+        for (int i = kBpCountWarningWatermark + 2; i <= kBpCountHighWatermark; i++) {
+            createProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(kInvalidUid, uid); // Limit callback should have been triggered.
+        createProxyOnce(kInvalidUid, kInvalidUid);
+        for (int i = kBpCountHighWatermark + 2; i >= kBpCountHighWatermark; i--) {
+            removeProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(kInvalidUid, kInvalidUid);
+
+        // Go down below the low watermark.
+        for (int i = kBpCountHighWatermark; i >= kBpCountLowWatermark; i--) {
+            removeProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        for (int i = kBpCountLowWatermark; i <= kBpCountWarningWatermark; i++) {
+            createProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(uid, kInvalidUid); // Warning callback should have been triggered.
+        for (int i = kBpCountWarningWatermark + 2; i <= kBpCountHighWatermark; i++) {
+            createProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(kInvalidUid, uid); // Limit callback should have been triggered.
+        createProxyOnce(kInvalidUid, kInvalidUid);
+        for (int i = kBpCountHighWatermark + 2; i >= kBpCountHighWatermark; i--) {
+            removeProxyOnce(kInvalidUid, kInvalidUid);
+        }
+        createProxyOnce(kInvalidUid, kInvalidUid);
+    }
+    EXPECT_EQ(BpBinder::getBinderProxyCount(), initialCount);
 }
 
 class BinderLibRpcTestBase : public BinderLibTest {
@@ -1436,7 +1986,7 @@ public:
         BinderLibTest::SetUp();
     }
 
-    std::tuple<android::base::unique_fd, unsigned int> CreateSocket() {
+    std::tuple<unique_fd, unsigned int> CreateSocket() {
         auto rpcServer = RpcServer::make();
         EXPECT_NE(nullptr, rpcServer);
         if (rpcServer == nullptr) return {};
@@ -1503,7 +2053,7 @@ public:
 TEST_P(BinderLibRpcTestP, SetRpcClientDebugNoFd) {
     auto binder = GetService();
     ASSERT_TRUE(binder != nullptr);
-    EXPECT_THAT(binder->setRpcClientDebug(android::base::unique_fd(), sp<BBinder>::make()),
+    EXPECT_THAT(binder->setRpcClientDebug(unique_fd(), sp<BBinder>::make()),
                 Debuggable(StatusEq(BAD_VALUE)));
 }
 
@@ -1515,8 +2065,8 @@ TEST_P(BinderLibRpcTestP, SetRpcClientDebugNoKeepAliveBinder) {
     EXPECT_THAT(binder->setRpcClientDebug(std::move(socket), nullptr),
                 Debuggable(StatusEq(UNEXPECTED_NULL)));
 }
-INSTANTIATE_TEST_CASE_P(BinderLibTest, BinderLibRpcTestP, testing::Bool(),
-                        BinderLibRpcTestP::ParamToString);
+INSTANTIATE_TEST_SUITE_P(BinderLibTest, BinderLibRpcTestP, testing::Bool(),
+                         BinderLibRpcTestP::ParamToString);
 
 class BinderLibTestService : public BBinder {
 public:
@@ -1550,9 +2100,8 @@ public:
         }
         switch (code) {
             case BINDER_LIB_TEST_REGISTER_SERVER: {
-                int32_t id;
                 sp<IBinder> binder;
-                id = data.readInt32();
+                /*id =*/data.readInt32();
                 binder = data.readStrongBinder();
                 if (binder == nullptr) {
                     return BAD_VALUE;
@@ -1629,6 +2178,9 @@ public:
 
             case BINDER_LIB_TEST_GETPID:
                 reply->writeInt32(getpid());
+                return NO_ERROR;
+            case BINDER_LIB_TEST_GETUID:
+                reply->writeInt32(getuid());
                 return NO_ERROR;
             case BINDER_LIB_TEST_NOP_TRANSACTION_WAIT:
                 usleep(5000);
@@ -1774,7 +2326,7 @@ public:
                 int ret;
                 int32_t size;
                 const void *buf;
-                android::base::unique_fd fd;
+                unique_fd fd;
 
                 ret = data.readUniqueParcelFileDescriptor(&fd);
                 if (ret != NO_ERROR) {
@@ -1790,6 +2342,40 @@ public:
                 }
                 ret = write(fd.get(), buf, size);
                 if (ret != size) return UNKNOWN_ERROR;
+                return NO_ERROR;
+            }
+            case BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_OWNED_TRANSACTION: {
+                unique_fd fd1(memfd_create("memfd1", MFD_CLOEXEC));
+                if (!fd1.ok()) {
+                    PLOGE("memfd_create failed");
+                    return UNKNOWN_ERROR;
+                }
+                unique_fd fd2(memfd_create("memfd2", MFD_CLOEXEC));
+                if (!fd2.ok()) {
+                    PLOGE("memfd_create failed");
+                    return UNKNOWN_ERROR;
+                }
+                status_t ret;
+                ret = reply->writeFileDescriptor(fd1.release(), true);
+                if (ret != NO_ERROR) {
+                    return ret;
+                }
+                ret = reply->writeFileDescriptor(fd2.release(), true);
+                if (ret != NO_ERROR) {
+                    return ret;
+                }
+                return NO_ERROR;
+            }
+            case BINDER_LIB_TEST_GET_FILE_DESCRIPTORS_UNOWNED_TRANSACTION: {
+                status_t ret;
+                ret = reply->writeFileDescriptor(STDOUT_FILENO, false);
+                if (ret != NO_ERROR) {
+                    return ret;
+                }
+                ret = reply->writeFileDescriptor(STDERR_FILENO, false);
+                if (ret != NO_ERROR) {
+                    return ret;
+                }
                 return NO_ERROR;
             }
             case BINDER_LIB_TEST_DELAYED_EXIT_TRANSACTION:
@@ -1819,6 +2405,26 @@ public:
                 reply->writeInt32(param.sched_priority);
                 return NO_ERROR;
             }
+            case BINDER_LIB_TEST_LISTEN_FOR_FROZEN_STATE_CHANGE: {
+                sp<IBinder> binder = data.readStrongBinder();
+                frozenStateChangeCallback = sp<TestFrozenStateChangeCallback>::make();
+                // Hold an strong pointer to the binder object so it doesn't go
+                // away.
+                frozenStateChangeCallback->binder = binder;
+                int ret = binder->addFrozenStateChangeCallback(frozenStateChangeCallback);
+                if (ret != NO_ERROR) {
+                    return ret;
+                }
+                auto event = frozenStateChangeCallback->events.popWithTimeout(1000ms);
+                if (!event.has_value()) {
+                    return NOT_ENOUGH_DATA;
+                }
+                return NO_ERROR;
+            }
+            case BINDER_LIB_TEST_CONSUME_STATE_CHANGE_EVENTS: {
+                reply->writeBoolVector(frozenStateChangeCallback->getAllAndClear());
+                return NO_ERROR;
+            }
             case BINDER_LIB_TEST_ECHO_VECTOR: {
                 std::vector<uint64_t> vector;
                 auto err = data.readUint64Vector(&vector);
@@ -1839,7 +2445,7 @@ public:
                     ALOGE("Could not make socket non-blocking: %s", strerror(errno));
                     return UNKNOWN_ERROR;
                 }
-                base::unique_fd out(sockets[0]);
+                unique_fd out(sockets[0]);
                 status_t writeResult = reply->writeUniqueFileDescriptor(out);
                 if (writeResult != NO_ERROR) {
                     ALOGE("Could not write unique_fd");
@@ -1905,6 +2511,7 @@ private:
     sp<IBinder> m_callback;
     bool m_exitOnDestroy;
     std::mutex m_blockMutex;
+    sp<TestFrozenStateChangeCallback> frozenStateChangeCallback;
 };
 
 int run_server(int index, int readypipefd, bool usePoll)
@@ -1921,6 +2528,8 @@ int run_server(int index, int readypipefd, bool usePoll)
 
     status_t ret;
     sp<IServiceManager> sm = defaultServiceManager();
+    sm->enableAddServiceCache(false);
+
     BinderLibTestService* testServicePtr;
     {
         sp<BinderLibTestService> testService = new BinderLibTestService(index);
@@ -1948,7 +2557,9 @@ int run_server(int index, int readypipefd, bool usePoll)
         if (index == 0) {
             ret = sm->addService(binderLibTestServiceName, testService);
         } else {
+            LIBBINDER_IGNORE("-Wdeprecated-declarations")
             sp<IBinder> server = sm->getService(binderLibTestServiceName);
+            LIBBINDER_IGNORE_END()
             Parcel data, reply;
             data.writeInt32(index);
             data.writeStrongBinder(testService);
@@ -2014,9 +2625,7 @@ int run_server(int index, int readypipefd, bool usePoll)
     return 1; /* joinThreadPool should not return */
 }
 
-int main(int argc, char **argv) {
-    ExitIfWrongAbi();
-
+int main(int argc, char** argv) {
     if (argc == 4 && !strcmp(argv[1], "--servername")) {
         binderservername = argv[2];
     } else {

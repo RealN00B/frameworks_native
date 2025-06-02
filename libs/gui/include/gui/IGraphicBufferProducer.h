@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include <optional>
 
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
@@ -28,9 +29,11 @@
 #include <ui/BufferQueueDefs.h>
 #include <ui/Fence.h>
 #include <ui/GraphicBuffer.h>
+#include <ui/PictureProfileHandle.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 
+#include <gui/AdditionalOptions.h>
 #include <gui/FrameTimestamps.h>
 #include <gui/HdrMetadata.h>
 
@@ -40,6 +43,8 @@
 
 #include <optional>
 #include <vector>
+
+#include <com_android_graphics_libgui_flags.h>
 
 namespace android {
 // ----------------------------------------------------------------------------
@@ -362,6 +367,14 @@ public:
         const HdrMetadata& getHdrMetadata() const { return hdrMetadata; }
         void setHdrMetadata(const HdrMetadata& metadata) { hdrMetadata = metadata; }
 
+        const std::optional<PictureProfileHandle>& getPictureProfileHandle() const {
+            return pictureProfileHandle;
+        }
+        void setPictureProfileHandle(const PictureProfileHandle& profile) {
+            pictureProfileHandle = profile;
+        }
+        void clearPictureProfileHandle() { pictureProfileHandle = std::nullopt; }
+
         int64_t timestamp{0};
         int isAutoTimestamp{0};
         android_dataspace dataSpace{HAL_DATASPACE_UNKNOWN};
@@ -374,6 +387,7 @@ public:
         bool getFrameTimestamps{false};
         int slot{-1};
         HdrMetadata hdrMetadata;
+        std::optional<PictureProfileHandle> pictureProfileHandle;
     };
 
     struct QueueBufferOutput : public Flattenable<QueueBufferOutput> {
@@ -400,7 +414,7 @@ public:
         uint64_t nextFrameNumber{0};
         FrameEventHistoryDelta frameTimestamps;
         bool bufferReplaced{false};
-        int maxBufferCount{0};
+        int maxBufferCount{BufferQueueDefs::NUM_BUFFER_SLOTS};
         status_t result{NO_ERROR};
     };
 
@@ -676,6 +690,16 @@ public:
     // the width and height used for dequeueBuffer will be additionally swapped.
     virtual status_t setAutoPrerotation(bool autoPrerotation);
 
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_SETFRAMERATE)
+    // Sets the apps intended frame rate.
+    virtual status_t setFrameRate(float frameRate, int8_t compatibility,
+                                  int8_t changeFrameRateStrategy);
+#endif
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_EXTENDEDALLOCATE)
+    virtual status_t setAdditionalOptions(const std::vector<gui::AdditionalOptions>& options);
+#endif
+
     struct RequestBufferOutput : public Flattenable<RequestBufferOutput> {
         RequestBufferOutput() = default;
 
@@ -854,6 +878,6 @@ class BnGraphicBufferProducer : public IGraphicBufferProducer {
 #endif
 
 // ----------------------------------------------------------------------------
-}; // namespace android
+} // namespace android
 
 #endif // ANDROID_GUI_IGRAPHICBUFFERPRODUCER_H

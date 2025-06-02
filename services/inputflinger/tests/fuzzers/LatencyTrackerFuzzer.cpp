@@ -15,6 +15,11 @@
  */
 
 #include <fuzzer/FuzzedDataProvider.h>
+#include <linux/input.h>
+
+#include "../../InputDeviceMetricsSource.h"
+#include "../InputEventTimeline.h"
+#include "NotifyArgsBuilders.h"
 #include "dispatcher/LatencyTracker.h"
 
 namespace android {
@@ -34,6 +39,10 @@ public:
             connectionTimeline.isComplete();
         }
     };
+
+    void pushLatencyStatistics() override {}
+
+    std::string dump(const char* prefix) const { return ""; };
 };
 
 static sp<IBinder> getConnectionToken(FuzzedDataProvider& fdp,
@@ -42,46 +51,60 @@ static sp<IBinder> getConnectionToken(FuzzedDataProvider& fdp,
     if (useExistingToken) {
         return tokens[fdp.ConsumeIntegralInRange<size_t>(0ul, tokens.size() - 1)];
     }
-    return new BBinder();
+    return sp<BBinder>::make();
 }
 
 extern "C" int LLVMFuzzerTestOneInput(uint8_t* data, size_t size) {
     FuzzedDataProvider fdp(data, size);
 
     EmptyProcessor emptyProcessor;
-    LatencyTracker tracker(&emptyProcessor);
+    LatencyTracker tracker(emptyProcessor);
 
     // Make some pre-defined tokens to ensure that some timelines are complete.
     std::array<sp<IBinder> /*token*/, 10> predefinedTokens;
-    for (size_t i = 0; i < predefinedTokens.size(); i++) {
-        predefinedTokens[i] = new BBinder();
+    for (sp<IBinder>& token : predefinedTokens) {
+        token = sp<BBinder>::make();
     }
 
     // Randomly invoke LatencyTracker api's until randomness is exhausted.
     while (fdp.remaining_bytes() > 0) {
         fdp.PickValueInArray<std::function<void()>>({
                 [&]() -> void {
-                    int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
-                    int32_t isDown = fdp.ConsumeBool();
-                    nsecs_t eventTime = fdp.ConsumeIntegral<nsecs_t>();
-                    nsecs_t readTime = fdp.ConsumeIntegral<nsecs_t>();
-                    tracker.trackListener(inputEventId, isDown, eventTime, readTime);
+                    const int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
+                    const nsecs_t eventTime = fdp.ConsumeIntegral<nsecs_t>();
+                    const nsecs_t readTime = fdp.ConsumeIntegral<nsecs_t>();
+                    const DeviceId deviceId = fdp.ConsumeIntegral<int32_t>();
+                    const int32_t source = fdp.ConsumeIntegral<int32_t>();
+                    std::set<InputDeviceUsageSource> sources = {
+                            fdp.ConsumeEnum<InputDeviceUsageSource>()};
+                    const int32_t inputEventActionType = fdp.ConsumeIntegral<int32_t>();
+                    const InputEventType inputEventType = fdp.ConsumeEnum<InputEventType>();
+                    const NotifyMotionArgs args =
+                            MotionArgsBuilder(inputEventActionType, source, inputEventId)
+                                    .eventTime(eventTime)
+                                    .readTime(readTime)
+                                    .deviceId(deviceId)
+                                    .pointer(PointerBuilder(/*id=*/0, ToolType::FINGER)
+                                                     .x(100)
+                                                     .y(200))
+                                    .build();
+                    tracker.trackListener(args);
                 },
                 [&]() -> void {
-                    int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
+                    const int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
                     sp<IBinder> connectionToken = getConnectionToken(fdp, predefinedTokens);
-                    nsecs_t deliveryTime = fdp.ConsumeIntegral<nsecs_t>();
-                    nsecs_t consumeTime = fdp.ConsumeIntegral<nsecs_t>();
-                    nsecs_t finishTime = fdp.ConsumeIntegral<nsecs_t>();
+                    const nsecs_t deliveryTime = fdp.ConsumeIntegral<nsecs_t>();
+                    const nsecs_t consumeTime = fdp.ConsumeIntegral<nsecs_t>();
+                    const nsecs_t finishTime = fdp.ConsumeIntegral<nsecs_t>();
                     tracker.trackFinishedEvent(inputEventId, connectionToken, deliveryTime,
                                                consumeTime, finishTime);
                 },
                 [&]() -> void {
-                    int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
+                    const int32_t inputEventId = fdp.ConsumeIntegral<int32_t>();
                     sp<IBinder> connectionToken = getConnectionToken(fdp, predefinedTokens);
-                    std::array<nsecs_t, GraphicsTimeline::SIZE> graphicsTimeline;
-                    for (size_t i = 0; i < graphicsTimeline.size(); i++) {
-                        graphicsTimeline[i] = fdp.ConsumeIntegral<nsecs_t>();
+                    std::array<nsecs_t, GraphicsTimeline::SIZE> graphicsTimeline{};
+                    for (nsecs_t& t : graphicsTimeline) {
+                        t = fdp.ConsumeIntegral<nsecs_t>();
                     }
                     tracker.trackGraphicsLatency(inputEventId, connectionToken, graphicsTimeline);
                 },

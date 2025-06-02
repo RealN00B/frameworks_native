@@ -29,17 +29,25 @@
 #include <math/mat4.h>
 #include <ui/DisplayedFrameStats.h>
 #include <ui/GraphicBuffer.h>
+#include <ui/PictureProfileHandle.h>
 #include <utils/StrongPointer.h>
 
+#include "DisplayHardware/Hal.h"
+
 #include <aidl/android/hardware/graphics/common/DisplayDecorationSupport.h>
+#include <aidl/android/hardware/graphics/common/HdrConversionCapability.h>
+#include <aidl/android/hardware/graphics/common/HdrConversionStrategy.h>
+#include <aidl/android/hardware/graphics/common/Transform.h>
 #include <aidl/android/hardware/graphics/composer3/Capability.h>
 #include <aidl/android/hardware/graphics/composer3/ClientTargetPropertyWithBrightness.h>
 #include <aidl/android/hardware/graphics/composer3/Color.h>
 #include <aidl/android/hardware/graphics/composer3/Composition.h>
 #include <aidl/android/hardware/graphics/composer3/DisplayCapability.h>
+#include <aidl/android/hardware/graphics/composer3/DisplayConfiguration.h>
+#include <aidl/android/hardware/graphics/composer3/DisplayLuts.h>
 #include <aidl/android/hardware/graphics/composer3/IComposerCallback.h>
+#include <aidl/android/hardware/graphics/composer3/OverlayProperties.h>
 
-#include <aidl/android/hardware/graphics/common/Transform.h>
 #include <optional>
 
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
@@ -65,12 +73,11 @@ using types::V1_0::Transform;
 using types::V1_1::RenderIntent;
 using types::V1_2::ColorMode;
 using types::V1_2::Dataspace;
-using types::V1_2::Hdr;
 using types::V1_2::PixelFormat;
 
+using hardware::graphics::composer::hal::Error;
 using V2_1::Config;
 using V2_1::Display;
-using V2_1::Error;
 using V2_1::Layer;
 using V2_4::CommandReaderBase;
 using V2_4::CommandWriterBase;
@@ -83,6 +90,8 @@ using PerFrameMetadata = IComposerClient::PerFrameMetadata;
 using PerFrameMetadataKey = IComposerClient::PerFrameMetadataKey;
 using PerFrameMetadataBlob = IComposerClient::PerFrameMetadataBlob;
 using AidlTransform = ::aidl::android::hardware::graphics::common::Transform;
+using DisplayConfiguration = V3_0::DisplayConfiguration;
+using aidl::android::hardware::graphics::common::Hdr;
 
 class Composer {
 public:
@@ -100,6 +109,7 @@ public:
     };
 
     virtual bool isSupported(OptionalFeature) const = 0;
+    virtual bool isVrrSupported() const = 0;
 
     virtual std::vector<aidl::android::hardware::graphics::composer3::Capability>
     getCapabilities() = 0;
@@ -107,12 +117,8 @@ public:
 
     virtual void registerCallback(HWC2::ComposerCallback& callback) = 0;
 
-    // Reset all pending commands in the command buffer. Useful if you want to
-    // skip a frame but have already queued some commands.
-    virtual void resetCommands() = 0;
-
     // Explicitly flush all pending commands in the command buffer.
-    virtual Error executeCommands() = 0;
+    virtual Error executeCommands(Display) = 0;
 
     virtual uint32_t getMaxVirtualDisplayCount() = 0;
     virtual Error createVirtualDisplay(uint32_t width, uint32_t height, PixelFormat*,
@@ -131,6 +137,10 @@ public:
     virtual Error getDisplayAttribute(Display display, Config config,
                                       IComposerClient::Attribute attribute, int32_t* outValue) = 0;
     virtual Error getDisplayConfigs(Display display, std::vector<Config>* outConfigs) = 0;
+
+    virtual Error getDisplayConfigurations(Display, int32_t maxFrameIntervalNs,
+                                           std::vector<DisplayConfiguration>*) = 0;
+
     virtual Error getDisplayName(Display display, std::string* outName) = 0;
 
     virtual Error getDisplayRequests(Display display, uint32_t* outDisplayRequestMask,
@@ -139,7 +149,7 @@ public:
 
     virtual Error getDozeSupport(Display display, bool* outSupport) = 0;
     virtual Error hasDisplayIdleTimerCapability(Display display, bool* outSupport) = 0;
-    virtual Error getHdrCapabilities(Display display, std::vector<Hdr>* outTypes,
+    virtual Error getHdrCapabilities(Display display, std::vector<Hdr>* outHdrTypes,
                                      float* outMaxLuminance, float* outMaxAverageLuminance,
                                      float* outMinLuminance) = 0;
 
@@ -157,7 +167,8 @@ public:
      */
     virtual Error setClientTarget(Display display, uint32_t slot, const sp<GraphicBuffer>& target,
                                   int acquireFence, Dataspace dataspace,
-                                  const std::vector<IComposerClient::Rect>& damage) = 0;
+                                  const std::vector<IComposerClient::Rect>& damage,
+                                  float hdrSdrRatio) = 0;
     virtual Error setColorMode(Display display, ColorMode mode, RenderIntent renderIntent) = 0;
     virtual Error setColorTransform(Display display, const float* matrix) = 0;
     virtual Error setOutputBuffer(Display display, const native_handle_t* buffer,
@@ -168,16 +179,21 @@ public:
     virtual Error setClientTargetSlotCount(Display display) = 0;
 
     virtual Error validateDisplay(Display display, nsecs_t expectedPresentTime,
-                                  uint32_t* outNumTypes, uint32_t* outNumRequests) = 0;
+                                  int32_t frameIntervalNs, uint32_t* outNumTypes,
+                                  uint32_t* outNumRequests) = 0;
 
     virtual Error presentOrValidateDisplay(Display display, nsecs_t expectedPresentTime,
-                                           uint32_t* outNumTypes, uint32_t* outNumRequests,
-                                           int* outPresentFence, uint32_t* state) = 0;
+                                           int32_t frameIntervalNs, uint32_t* outNumTypes,
+                                           uint32_t* outNumRequests, int* outPresentFence,
+                                           uint32_t* state) = 0;
 
     virtual Error setCursorPosition(Display display, Layer layer, int32_t x, int32_t y) = 0;
     /* see setClientTarget for the purpose of slot */
     virtual Error setLayerBuffer(Display display, Layer layer, uint32_t slot,
                                  const sp<GraphicBuffer>& buffer, int acquireFence) = 0;
+    virtual Error setLayerBufferSlotsToClear(Display display, Layer layer,
+                                             const std::vector<uint32_t>& slotsToClear,
+                                             uint32_t activeBufferSlot) = 0;
     virtual Error setLayerSurfaceDamage(Display display, Layer layer,
                                         const std::vector<IComposerClient::Rect>& damage) = 0;
     virtual Error setLayerBlendMode(Display display, Layer layer,
@@ -247,7 +263,7 @@ public:
             Display display, IComposerClient::DisplayConnectionType* outType) = 0;
     virtual V2_4::Error getDisplayVsyncPeriod(Display display,
                                               VsyncPeriodNanos* outVsyncPeriod) = 0;
-    virtual V2_4::Error setActiveConfigWithConstraints(
+    virtual Error setActiveConfigWithConstraints(
             Display display, Config config,
             const IComposerClient::VsyncPeriodChangeConstraints& vsyncPeriodChangeConstraints,
             VsyncPeriodChangeTimeline* outTimeline) = 0;
@@ -281,6 +297,22 @@ public:
     virtual Error setIdleTimerEnabled(Display displayId, std::chrono::milliseconds timeout) = 0;
     virtual Error getPhysicalDisplayOrientation(Display displayId,
                                                 AidlTransform* outDisplayOrientation) = 0;
+    virtual Error getOverlaySupport(V3_0::OverlayProperties* outProperties) = 0;
+    virtual void onHotplugConnect(Display) = 0;
+    virtual void onHotplugDisconnect(Display) = 0;
+    virtual Error getHdrConversionCapabilities(
+            std::vector<::aidl::android::hardware::graphics::common::HdrConversionCapability>*) = 0;
+    virtual Error setHdrConversionStrategy(
+            ::aidl::android::hardware::graphics::common::HdrConversionStrategy, Hdr*) = 0;
+    virtual Error setRefreshRateChangedCallbackDebugEnabled(Display, bool) = 0;
+    virtual Error notifyExpectedPresent(Display, nsecs_t expectedPresentTime,
+                                        int32_t frameIntervalNs) = 0;
+    virtual Error getRequestedLuts(Display display, std::vector<Layer>* outLayers,
+                                   std::vector<V3_0::DisplayLuts::LayerLut>* outLuts) = 0;
+    virtual Error setLayerLuts(Display display, Layer layer, V3_0::Luts& luts) = 0;
+    virtual Error getMaxLayerPictureProfiles(Display display, int32_t* outMaxProfiles) = 0;
+    virtual Error setDisplayPictureProfileId(Display display, PictureProfileId id) = 0;
+    virtual Error setLayerPictureProfileId(Display display, Layer layer, PictureProfileId id) = 0;
 };
 
 } // namespace Hwc2

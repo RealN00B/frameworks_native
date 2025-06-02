@@ -40,9 +40,6 @@ ndk_library {
     symbol_file: "libEGL.map.txt",
     first_version: "9",
     unversioned_until: "current",
-    export_header_libs: [
-        "libEGL_headers",
-    ],
 }
 
 ndk_library {
@@ -50,9 +47,6 @@ ndk_library {
     symbol_file: "libGLESv1_CM.map.txt",
     first_version: "9",
     unversioned_until: "current",
-    export_header_libs: [
-        "libGLESv1_CM_headers",
-    ],
 }
 
 ndk_library {
@@ -60,9 +54,6 @@ ndk_library {
     symbol_file: "libGLESv2.map.txt",
     first_version: "9",
     unversioned_until: "current",
-    export_header_libs: [
-        "libGLESv2_headers",
-    ],
 }
 
 ndk_library {
@@ -70,9 +61,18 @@ ndk_library {
     symbol_file: "libGLESv3.map.txt",
     first_version: "18",
     unversioned_until: "current",
-    export_header_libs: [
-        "libGLESv3_headers",
-    ],
+}
+
+aconfig_declarations {
+    name: "egl_flags",
+    package: "com.android.graphics.egl.flags",
+    container: "system",
+    srcs: ["EGL/egl_flags.aconfig"],
+}
+
+cc_aconfig_library {
+    name: "libegl_flags",
+    aconfig_declarations: "egl_flags",
 }
 
 cc_defaults {
@@ -144,8 +144,13 @@ cc_library_static {
     srcs: [
         "EGL/BlobCache.cpp",
         "EGL/FileBlobCache.cpp",
+        "EGL/MultifileBlobCache.cpp",
     ],
     export_include_dirs: ["EGL"],
+    shared_libs: [
+        "libegl_flags",
+        "libz",
+    ],
 }
 
 cc_library_shared {
@@ -174,12 +179,14 @@ cc_library_shared {
         "android.hardware.configstore@1.0",
         "android.hardware.configstore-utils",
         "libbase",
+        "libegl_flags",
         "libhidlbase",
         "libnativebridge_lazy",
         "libnativeloader_lazy",
         "libutils",
         "libSurfaceFlingerProp",
         "libunwindstack",
+        "libz",
     ],
     static_libs: [
         "libEGL_getProcAddress",
@@ -204,6 +211,14 @@ cc_test {
     srcs: [
         "EGL/BlobCache.cpp",
         "EGL/BlobCache_test.cpp",
+        "EGL/FileBlobCache.cpp",
+        "EGL/MultifileBlobCache.cpp",
+        "EGL/MultifileBlobCache_test.cpp",
+    ],
+    shared_libs: [
+        "libegl_flags",
+        "libutils",
+        "libz",
     ],
 }
 

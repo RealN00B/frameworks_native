@@ -21,6 +21,7 @@
 #include <binder/AppOpsManager.h>
 #include <binder/IPermissionController.h>
 #include <binder/IServiceManager.h>
+#include <android_permission_flags.h>
 
 /*
  * The permission to use for activity recognition sensors (like step counter).
@@ -74,7 +75,7 @@ Sensor::Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersi
         if (hwSensor.maxDelay > INT_MAX) {
             // Max delay is declared as a 64 bit integer for 64 bit architectures. But it should
             // always fit in a 32 bit integer, log error and cap it to INT_MAX.
-            ALOGE("Sensor maxDelay overflow error %s %" PRId64, mName.string(),
+            ALOGE("Sensor maxDelay overflow error %s %" PRId64, mName.c_str(),
                   static_cast<int64_t>(hwSensor.maxDelay));
             mMaxDelay = INT_MAX;
         } else {
@@ -121,7 +122,9 @@ Sensor::Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersi
         break;
     case SENSOR_TYPE_HEART_RATE: {
         mStringType = SENSOR_STRING_TYPE_HEART_RATE;
-        mRequiredPermission = SENSOR_PERMISSION_BODY_SENSORS;
+        mRequiredPermission =
+          android::permission::flags::replace_body_sensor_permission_enabled() ?
+            SENSOR_PERMISSION_READ_HEART_RATE : SENSOR_PERMISSION_BODY_SENSORS;
         AppOpsManager appOps;
         mRequiredAppOp = appOps.permissionToOpCode(String16(mRequiredPermission));
         mFlags |= SENSOR_FLAG_ON_CHANGE_MODE;
@@ -264,10 +267,6 @@ Sensor::Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersi
         mStringType = SENSOR_STRING_TYPE_HEART_BEAT;
         mFlags |= SENSOR_FLAG_SPECIAL_REPORTING_MODE;
         break;
-
-    // TODO:  Placeholder for LLOB sensor type
-
-
     case SENSOR_TYPE_ACCELEROMETER_UNCALIBRATED:
         mStringType = SENSOR_STRING_TYPE_ACCELEROMETER_UNCALIBRATED;
         mFlags |= SENSOR_FLAG_CONTINUOUS_MODE;
@@ -307,7 +306,18 @@ Sensor::Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersi
         }
         if (halVersion > SENSORS_DEVICE_API_VERSION_1_0 && hwSensor.requiredPermission) {
             mRequiredPermission = hwSensor.requiredPermission;
-            if (!strcmp(mRequiredPermission, SENSOR_PERMISSION_BODY_SENSORS)) {
+            bool requiresBodySensorPermission =
+                    !strcmp(mRequiredPermission, SENSOR_PERMISSION_BODY_SENSORS);
+            if (android::permission::flags::replace_body_sensor_permission_enabled()) {
+                if (requiresBodySensorPermission) {
+                  ALOGE("Sensor %s using deprecated Body Sensor permission", mName.c_str());
+                }
+
+                AppOpsManager appOps;
+                // Lookup to see if an AppOp exists for the permission. If none
+                // does, the default value of -1 is used.
+                mRequiredAppOp = appOps.permissionToOpCode(String16(mRequiredPermission));
+            } else if (requiresBodySensorPermission) {
                 AppOpsManager appOps;
                 mRequiredAppOp = appOps.permissionToOpCode(String16(SENSOR_PERMISSION_BODY_SENSORS));
             }
@@ -339,7 +349,7 @@ Sensor::Sensor(struct sensor_t const& hwSensor, const uuid_t& uuid, int halVersi
         if (actualReportingMode != expectedReportingMode) {
             ALOGE("Reporting Mode incorrect: sensor %s handle=%#010" PRIx32 " type=%" PRId32 " "
                    "actual=%d expected=%d",
-                   mName.string(), mHandle, mType, actualReportingMode, expectedReportingMode);
+                   mName.c_str(), mHandle, mType, actualReportingMode, expectedReportingMode);
         }
     }
 
@@ -617,7 +627,7 @@ void Sensor::flattenString8(void*& buffer, size_t& size,
         const String8& string8) {
     uint32_t len = static_cast<uint32_t>(string8.length());
     FlattenableUtils::write(buffer, size, len);
-    memcpy(static_cast<char*>(buffer), string8.string(), len);
+    memcpy(static_cast<char*>(buffer), string8.c_str(), len);
     FlattenableUtils::advance(buffer, size, len);
     size -= FlattenableUtils::align<4>(buffer);
 }
@@ -631,8 +641,14 @@ bool Sensor::unflattenString8(void const*& buffer, size_t& size, String8& output
     if (size < len) {
         return false;
     }
-    outputString8.setTo(static_cast<char const*>(buffer), len);
+    outputString8 = String8(static_cast<char const*>(buffer), len);
+
+    if (size < FlattenableUtils::align<4>(len)) {
+        ALOGE("Malformed Sensor String8 field. Should be in a 4-byte aligned buffer but is not.");
+        return false;
+    }
     FlattenableUtils::advance(buffer, size, FlattenableUtils::align<4>(len));
+
     return true;
 }
 

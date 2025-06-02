@@ -14,15 +14,19 @@
  * limitations under the License.
  */
 
-#include <android-base/logging.h>
 #include <android/binder_ibinder.h>
 #include <android/binder_ibinder_platform.h>
 #include <android/binder_stability.h>
 #include <android/binder_status.h>
+#include <binder/Functional.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IResultReceiver.h>
+#include <binder/Trace.h>
+#if __has_include(<private/android_filesystem_config.h>)
 #include <private/android_filesystem_config.h>
+#endif
 
+#include "../BuildFlags.h"
 #include "ibinder_internal.h"
 #include "parcel_internal.h"
 #include "status_internal.h"
@@ -38,16 +42,35 @@ using ::android::statusToString;
 using ::android::String16;
 using ::android::String8;
 using ::android::wp;
+using ::android::binder::impl::make_scope_guard;
+using ::android::binder::impl::scope_guard;
+using ::android::binder::os::get_trace_enabled_tags;
+using ::android::binder::os::trace_begin;
+using ::android::binder::os::trace_end;
+
+// transaction codes for getInterfaceHash and getInterfaceVersion are defined
+// in file : system/tools/aidl/aidl.cpp
+static constexpr int kGetInterfaceVersionId = 0x00fffffe;
+static const char* kInterfaceVersion = "getInterfaceVersion";
+static constexpr int kGetInterfaceHashId = 0x00fffffd;
+static const char* kInterfaceHash = "getInterfaceHash";
+static const char* kNdkTrace = "AIDL::ndk::";
+static const char* kServerTrace = "::server";
+static const char* kClientTrace = "::client";
+static const char* kSeparator = "::";
+static const char* kUnknownCode = "Unknown_Transaction_Code:";
 
 namespace ABBinderTag {
 
 static const void* kId = "ABBinder";
 static void* kValue = static_cast<void*>(new bool{true});
-void clean(const void* /*id*/, void* /*obj*/, void* /*cookie*/){/* do nothing */};
+void clean(const void* /*id*/, void* /*obj*/, void* /*cookie*/) {
+    /* do nothing */
+}
 
 static void attach(const sp<IBinder>& binder) {
-    // can only attach once
-    CHECK_EQ(nullptr, binder->attachObject(kId, kValue, nullptr /*cookie*/, clean));
+    auto alreadyAttached = binder->attachObject(kId, kValue, nullptr /*cookie*/, clean);
+    LOG_ALWAYS_FATAL_IF(alreadyAttached != nullptr, "can only attach once");
 }
 static bool has(const sp<IBinder>& binder) {
     return binder != nullptr && binder->findObject(kId) == kValue;
@@ -63,12 +86,12 @@ struct Value {
 };
 void clean(const void* id, void* obj, void* cookie) {
     // be weary of leaks!
-    // LOG(INFO) << "Deleting an ABpBinder";
+    // ALOGI("Deleting an ABpBinder");
 
-    CHECK(id == kId) << id << " " << obj << " " << cookie;
+    LOG_ALWAYS_FATAL_IF(id != kId, "%p %p %p", id, obj, cookie);
 
     delete static_cast<Value*>(obj);
-};
+}
 
 }  // namespace ABpBinderTag
 
@@ -84,6 +107,51 @@ static std::string SanitizeString(const String16& str) {
         }
     }
     return sanitized;
+}
+
+const std::string getMethodName(const AIBinder_Class* clazz, transaction_code_t code) {
+    // TODO(b/150155678) - Move getInterfaceHash and getInterfaceVersion to libbinder and remove
+    // hardcoded cases.
+    if (code <= clazz->getTransactionCodeToFunctionLength() && code >= FIRST_CALL_TRANSACTION) {
+        // Codes have FIRST_CALL_TRANSACTION as added offset. Subtract to access function name
+        return clazz->getFunctionName(code);
+    } else if (code == kGetInterfaceVersionId) {
+        return kInterfaceVersion;
+    } else if (code == kGetInterfaceHashId) {
+        return kInterfaceHash;
+    }
+    return kUnknownCode + std::to_string(code);
+}
+
+const std::string getTraceSectionName(const AIBinder_Class* clazz, transaction_code_t code,
+                                      bool isServer) {
+    if (clazz == nullptr) {
+        ALOGE("class associated with binder is null. Class is needed to add trace with interface "
+              "name and function name");
+        return kNdkTrace;
+    }
+
+    const std::string descriptor = clazz->getInterfaceDescriptorUtf8();
+    const std::string methodName = getMethodName(clazz, code);
+
+    size_t traceSize =
+            strlen(kNdkTrace) + descriptor.size() + strlen(kSeparator) + methodName.size();
+    traceSize += isServer ? strlen(kServerTrace) : strlen(kClientTrace);
+
+    std::string trace;
+    // reserve to avoid repeated allocations
+    trace.reserve(traceSize);
+
+    trace += kNdkTrace;
+    trace += clazz->getInterfaceDescriptorUtf8();
+    trace += kSeparator;
+    trace += methodName;
+    trace += isServer ? kServerTrace : kClientTrace;
+
+    LOG_ALWAYS_FATAL_IF(trace.size() != traceSize, "Trace size mismatch. Expected %zu, got %zu",
+                        traceSize, trace.size());
+
+    return trace;
 }
 
 bool AIBinder::associateClass(const AIBinder_Class* clazz) {
@@ -119,14 +187,13 @@ bool AIBinder::associateClass(const AIBinder_Class* clazz) {
     if (mClazz != nullptr && !asABpBinder()) {
         const String16& currentDescriptor = mClazz->getInterfaceDescriptor();
         if (newDescriptor == currentDescriptor) {
-            LOG(ERROR) << __func__ << ": Class descriptors '" << currentDescriptor
-                       << "' match during associateClass, but they are different class objects ("
-                       << clazz << " vs " << mClazz << "). Class descriptor collision?";
+            ALOGE("Class descriptors '%s' match during associateClass, but they are different class"
+                  " objects (%p vs %p). Class descriptor collision?",
+                  String8(currentDescriptor).c_str(), clazz, mClazz);
         } else {
-            LOG(ERROR) << __func__
-                       << ": Class cannot be associated on object which already has a class. "
-                          "Trying to associate to '"
-                       << newDescriptor << "' but already set to '" << currentDescriptor << "'.";
+            ALOGE("%s: Class cannot be associated on object which already has a class. "
+                  "Trying to associate to '%s' but already set to '%s'.",
+                  __func__, String8(newDescriptor).c_str(), String8(currentDescriptor).c_str());
         }
 
         // always a failure because we know mClazz != clazz
@@ -137,15 +204,14 @@ bool AIBinder::associateClass(const AIBinder_Class* clazz) {
     // since it's an error condition. Do the comparison after we take the lock and
     // check the pointer equality fast path. By always taking the lock, it's also
     // more flake-proof. However, the check is not dependent on the lock.
-    if (descriptor != newDescriptor) {
+    if (descriptor != newDescriptor && !(asABpBinder() && asABpBinder()->isServiceFuzzing())) {
         if (getBinder()->isBinderAlive()) {
-            LOG(ERROR) << __func__ << ": Expecting binder to have class '" << newDescriptor
-                       << "' but descriptor is actually '" << SanitizeString(descriptor) << "'.";
+            ALOGE("%s: Expecting binder to have class '%s' but descriptor is actually '%s'.",
+                  __func__, String8(newDescriptor).c_str(), SanitizeString(descriptor).c_str());
         } else {
             // b/155793159
-            LOG(ERROR) << __func__ << ": Cannot associate class '" << newDescriptor
-                       << "' to dead binder with cached descriptor '" << SanitizeString(descriptor)
-                       << "'.";
+            ALOGE("%s: Cannot associate class '%s' to dead binder with cached descriptor '%s'.",
+                  __func__, String8(newDescriptor).c_str(), SanitizeString(descriptor).c_str());
         }
         return false;
     }
@@ -162,7 +228,7 @@ bool AIBinder::associateClass(const AIBinder_Class* clazz) {
 
 ABBinder::ABBinder(const AIBinder_Class* clazz, void* userData)
     : AIBinder(clazz), BBinder(), mUserData(userData) {
-    CHECK(clazz != nullptr);
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr, "clazz == nullptr");
 }
 ABBinder::~ABBinder() {
     getClass()->onDestroy(mUserData);
@@ -182,7 +248,7 @@ status_t ABBinder::dump(int fd, const ::android::Vector<String16>& args) {
     // technically UINT32_MAX would be okay here, but INT32_MAX is expected since this may be
     // null in Java
     if (args.size() > INT32_MAX) {
-        LOG(ERROR) << "ABBinder::dump received too many arguments: " << args.size();
+        ALOGE("ABBinder::dump received too many arguments: %zu", args.size());
         return STATUS_BAD_VALUE;
     }
 
@@ -201,6 +267,17 @@ status_t ABBinder::dump(int fd, const ::android::Vector<String16>& args) {
 
 status_t ABBinder::onTransact(transaction_code_t code, const Parcel& data, Parcel* reply,
                               binder_flags_t flags) {
+    std::string sectionName;
+    bool tracingEnabled = get_trace_enabled_tags() & ATRACE_TAG_AIDL;
+    if (tracingEnabled) {
+        sectionName = getTraceSectionName(getClass(), code, true /*isServer*/);
+        trace_begin(ATRACE_TAG_AIDL, sectionName.c_str());
+    }
+
+    scope_guard guard = make_scope_guard([&]() {
+        if (tracingEnabled) trace_end(ATRACE_TAG_AIDL);
+    });
+
     if (isUserCommand(code)) {
         if (getClass()->writeHeader && !data.checkInterface(this)) {
             return STATUS_BAD_TYPE;
@@ -212,6 +289,12 @@ status_t ABBinder::onTransact(transaction_code_t code, const Parcel& data, Parce
         binder_status_t status = getClass()->onTransact(this, code, &in, &out);
         return PruneStatusT(status);
     } else if (code == SHELL_COMMAND_TRANSACTION && getClass()->handleShellCommand != nullptr) {
+        if constexpr (!android::kEnableKernelIpc) {
+            // Non-IPC builds do not have getCallingUid(),
+            // so we have no way of authenticating the caller
+            return STATUS_PERMISSION_DENIED;
+        }
+
         int in = data.readFileDescriptor();
         int out = data.readFileDescriptor();
         int err = data.readFileDescriptor();
@@ -229,7 +312,11 @@ status_t ABBinder::onTransact(transaction_code_t code, const Parcel& data, Parce
 
         // Shell commands should only be callable by ADB.
         uid_t uid = AIBinder_getCallingUid();
-        if (uid != AID_ROOT && uid != AID_SHELL) {
+        if (uid != 0 /* root */
+#ifdef AID_SHELL
+            && uid != AID_SHELL
+#endif
+        ) {
             if (resultReceiver != nullptr) {
                 resultReceiver->send(-1);
             }
@@ -255,11 +342,24 @@ status_t ABBinder::onTransact(transaction_code_t code, const Parcel& data, Parce
     }
 }
 
+void ABBinder::addDeathRecipient(const ::android::sp<AIBinder_DeathRecipient>& /* recipient */,
+                                 void* /* cookie */) {
+    LOG_ALWAYS_FATAL("Should not reach this. Can't linkToDeath local binders.");
+}
+
 ABpBinder::ABpBinder(const ::android::sp<::android::IBinder>& binder)
     : AIBinder(nullptr /*clazz*/), mRemote(binder) {
-    CHECK(binder != nullptr);
+    LOG_ALWAYS_FATAL_IF(binder == nullptr, "binder == nullptr");
 }
-ABpBinder::~ABpBinder() {}
+
+ABpBinder::~ABpBinder() {
+    for (auto& recip : mDeathRecipients) {
+        sp<AIBinder_DeathRecipient> strongRecip = recip.recipient.promote();
+        if (strongRecip) {
+            strongRecip->pruneThisTransferEntry(getBinder(), recip.cookie);
+        }
+    }
+}
 
 sp<AIBinder> ABpBinder::lookupOrCreateFromBinder(const ::android::sp<::android::IBinder>& binder) {
     if (binder == nullptr) {
@@ -296,6 +396,12 @@ sp<AIBinder> ABpBinder::lookupOrCreateFromBinder(const ::android::sp<::android::
     });
 
     return ret;
+}
+
+void ABpBinder::addDeathRecipient(const ::android::sp<AIBinder_DeathRecipient>& recipient,
+                                  void* cookie) {
+    std::lock_guard<std::mutex> l(mDeathRecipientsMutex);
+    mDeathRecipients.emplace_back(recipient, cookie);
 }
 
 struct AIBinder_Weak {
@@ -354,6 +460,31 @@ AIBinder_Class::AIBinder_Class(const char* interfaceDescriptor, AIBinder_Class_o
       mInterfaceDescriptor(interfaceDescriptor),
       mWideInterfaceDescriptor(interfaceDescriptor) {}
 
+bool AIBinder_Class::setTransactionCodeMap(const char** transactionCodeMap, size_t length) {
+    if (mTransactionCodeToFunction != nullptr) {
+        ALOGE("mTransactionCodeToFunction is already set!");
+        return false;
+    }
+    mTransactionCodeToFunction = transactionCodeMap;
+    mTransactionCodeToFunctionLength = length;
+    return true;
+}
+
+const char* AIBinder_Class::getFunctionName(transaction_code_t code) const {
+    if (mTransactionCodeToFunction == nullptr) {
+        ALOGE("mTransactionCodeToFunction is not set!");
+        return nullptr;
+    }
+
+    if (code < FIRST_CALL_TRANSACTION ||
+        code - FIRST_CALL_TRANSACTION >= mTransactionCodeToFunctionLength) {
+        ALOGE("Function name for requested code not found!");
+        return nullptr;
+    }
+
+    return mTransactionCodeToFunction[code - FIRST_CALL_TRANSACTION];
+}
+
 AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
                                       AIBinder_Class_onCreate onCreate,
                                       AIBinder_Class_onDestroy onDestroy,
@@ -367,27 +498,45 @@ AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
 }
 
 void AIBinder_Class_setOnDump(AIBinder_Class* clazz, AIBinder_onDump onDump) {
-    CHECK(clazz != nullptr) << "setOnDump requires non-null clazz";
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr, "setOnDump requires non-null clazz");
 
     // this is required to be called before instances are instantiated
     clazz->onDump = onDump;
 }
 
+void AIBinder_Class_setTransactionCodeToFunctionNameMap(AIBinder_Class* clazz,
+                                                        const char** transactionCodeToFunction,
+                                                        size_t length) {
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr || transactionCodeToFunction == nullptr,
+                        "Valid clazz and transactionCodeToFunction are needed to set code to "
+                        "function mapping.");
+    LOG_ALWAYS_FATAL_IF(!clazz->setTransactionCodeMap(transactionCodeToFunction, length),
+                        "Failed to set transactionCodeToFunction to clazz! Is "
+                        "transactionCodeToFunction already set?");
+}
+
+const char* AIBinder_Class_getFunctionName(AIBinder_Class* clazz, transaction_code_t code) {
+    LOG_ALWAYS_FATAL_IF(
+            clazz == nullptr,
+            "Valid clazz is needed to get function name for requested transaction code");
+    return clazz->getFunctionName(code);
+}
+
 void AIBinder_Class_disableInterfaceTokenHeader(AIBinder_Class* clazz) {
-    CHECK(clazz != nullptr) << "disableInterfaceTokenHeader requires non-null clazz";
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr, "disableInterfaceTokenHeader requires non-null clazz");
 
     clazz->writeHeader = false;
 }
 
 void AIBinder_Class_setHandleShellCommand(AIBinder_Class* clazz,
                                           AIBinder_handleShellCommand handleShellCommand) {
-    CHECK(clazz != nullptr) << "setHandleShellCommand requires non-null clazz";
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr, "setHandleShellCommand requires non-null clazz");
 
     clazz->handleShellCommand = handleShellCommand;
 }
 
 const char* AIBinder_Class_getDescriptor(const AIBinder_Class* clazz) {
-    CHECK(clazz != nullptr) << "getDescriptor requires non-null clazz";
+    LOG_ALWAYS_FATAL_IF(clazz == nullptr, "getDescriptor requires non-null clazz");
 
     return clazz->getInterfaceDescriptorUtf8();
 }
@@ -399,8 +548,8 @@ AIBinder_DeathRecipient::TransferDeathRecipient::~TransferDeathRecipient() {
 }
 
 void AIBinder_DeathRecipient::TransferDeathRecipient::binderDied(const wp<IBinder>& who) {
-    CHECK(who == mWho) << who.unsafe_get() << "(" << who.get_refs() << ") vs " << mWho.unsafe_get()
-                       << " (" << mWho.get_refs() << ")";
+    LOG_ALWAYS_FATAL_IF(who != mWho, "%p (%p) vs %p (%p)", who.unsafe_get(), who.get_refs(),
+                        mWho.unsafe_get(), mWho.get_refs());
 
     mOnDied(mCookie);
 
@@ -411,7 +560,7 @@ void AIBinder_DeathRecipient::TransferDeathRecipient::binderDied(const wp<IBinde
     if (recipient != nullptr && strongWho != nullptr) {
         status_t result = recipient->unlinkToDeath(strongWho, mCookie);
         if (result != ::android::DEAD_OBJECT) {
-            LOG(WARNING) << "Unlinking to dead binder resulted in: " << result;
+            ALOGW("Unlinking to dead binder resulted in: %d", result);
         }
     }
 
@@ -420,7 +569,18 @@ void AIBinder_DeathRecipient::TransferDeathRecipient::binderDied(const wp<IBinde
 
 AIBinder_DeathRecipient::AIBinder_DeathRecipient(AIBinder_DeathRecipient_onBinderDied onDied)
     : mOnDied(onDied), mOnUnlinked(nullptr) {
-    CHECK(onDied != nullptr);
+    LOG_ALWAYS_FATAL_IF(onDied == nullptr, "onDied == nullptr");
+}
+
+void AIBinder_DeathRecipient::pruneThisTransferEntry(const sp<IBinder>& who, void* cookie) {
+    std::lock_guard<std::mutex> l(mDeathRecipientsMutex);
+    mDeathRecipients.erase(std::remove_if(mDeathRecipients.begin(), mDeathRecipients.end(),
+                                          [&](const sp<TransferDeathRecipient>& tdr) {
+                                              auto tdrWho = tdr->getWho();
+                                              return tdrWho != nullptr && tdrWho.promote() == who &&
+                                                     cookie == tdr->getCookie();
+                                          }),
+                           mDeathRecipients.end());
 }
 
 void AIBinder_DeathRecipient::pruneDeadTransferEntriesLocked() {
@@ -432,9 +592,24 @@ void AIBinder_DeathRecipient::pruneDeadTransferEntriesLocked() {
 }
 
 binder_status_t AIBinder_DeathRecipient::linkToDeath(const sp<IBinder>& binder, void* cookie) {
-    CHECK(binder != nullptr);
+    LOG_ALWAYS_FATAL_IF(binder == nullptr, "binder == nullptr");
 
     std::lock_guard<std::mutex> l(mDeathRecipientsMutex);
+
+    if (mOnUnlinked && cookie &&
+        std::find_if(mDeathRecipients.begin(), mDeathRecipients.end(),
+                     [&cookie](android::sp<TransferDeathRecipient> recipient) {
+                         return recipient->getCookie() == cookie;
+                     }) != mDeathRecipients.end()) {
+        ALOGE("Attempting to AIBinder_linkToDeath with the same cookie with an onUnlink callback. "
+              "This will cause the onUnlinked callback to be called multiple times with the same "
+              "cookie, which is usually not intended.");
+    }
+    if (!mOnUnlinked && cookie) {
+        ALOGW("AIBinder_linkToDeath is being called with a non-null cookie and no onUnlink "
+              "callback set. This might not be intended. AIBinder_DeathRecipient_setOnUnlinked "
+              "should be called first.");
+    }
 
     sp<TransferDeathRecipient> recipient =
             new TransferDeathRecipient(binder, cookie, this, mOnDied, mOnUnlinked);
@@ -453,7 +628,7 @@ binder_status_t AIBinder_DeathRecipient::linkToDeath(const sp<IBinder>& binder, 
 }
 
 binder_status_t AIBinder_DeathRecipient::unlinkToDeath(const sp<IBinder>& binder, void* cookie) {
-    CHECK(binder != nullptr);
+    LOG_ALWAYS_FATAL_IF(binder == nullptr, "binder == nullptr");
 
     std::lock_guard<std::mutex> l(mDeathRecipientsMutex);
 
@@ -465,9 +640,8 @@ binder_status_t AIBinder_DeathRecipient::unlinkToDeath(const sp<IBinder>& binder
 
             status_t status = binder->unlinkToDeath(recipient, cookie, 0 /*flags*/);
             if (status != ::android::OK) {
-                LOG(ERROR) << __func__
-                           << ": removed reference to death recipient but unlink failed: "
-                           << statusToString(status);
+                ALOGE("%s: removed reference to death recipient but unlink failed: %s", __func__,
+                      statusToString(status).c_str());
             }
             return PruneStatusT(status);
         }
@@ -484,7 +658,7 @@ void AIBinder_DeathRecipient::setOnUnlinked(AIBinder_DeathRecipient_onBinderUnli
 
 AIBinder* AIBinder_new(const AIBinder_Class* clazz, void* args) {
     if (clazz == nullptr) {
-        LOG(ERROR) << __func__ << ": Must provide class to construct local binder.";
+        ALOGE("%s: Must provide class to construct local binder.", __func__);
         return nullptr;
     }
 
@@ -548,20 +722,21 @@ binder_status_t AIBinder_dump(AIBinder* binder, int fd, const char** args, uint3
 binder_status_t AIBinder_linkToDeath(AIBinder* binder, AIBinder_DeathRecipient* recipient,
                                      void* cookie) {
     if (binder == nullptr || recipient == nullptr) {
-        LOG(ERROR) << __func__ << ": Must provide binder (" << binder << ") and recipient ("
-                   << recipient << ")";
+        ALOGE("%s: Must provide binder (%p) and recipient (%p)", __func__, binder, recipient);
         return STATUS_UNEXPECTED_NULL;
     }
 
-    // returns binder_status_t
-    return recipient->linkToDeath(binder->getBinder(), cookie);
+    binder_status_t ret = recipient->linkToDeath(binder->getBinder(), cookie);
+    if (ret == STATUS_OK) {
+        binder->addDeathRecipient(recipient, cookie);
+    }
+    return ret;
 }
 
 binder_status_t AIBinder_unlinkToDeath(AIBinder* binder, AIBinder_DeathRecipient* recipient,
                                        void* cookie) {
     if (binder == nullptr || recipient == nullptr) {
-        LOG(ERROR) << __func__ << ": Must provide binder (" << binder << ") and recipient ("
-                   << recipient << ")";
+        ALOGE("%s: Must provide binder (%p) and recipient (%p)", __func__, binder, recipient);
         return STATUS_UNEXPECTED_NULL;
     }
 
@@ -569,6 +744,7 @@ binder_status_t AIBinder_unlinkToDeath(AIBinder* binder, AIBinder_DeathRecipient
     return recipient->unlinkToDeath(binder->getBinder(), cookie);
 }
 
+#ifdef BINDER_WITH_KERNEL_IPC
 uid_t AIBinder_getCallingUid() {
     return ::android::IPCThreadState::self()->getCallingUid();
 }
@@ -580,6 +756,7 @@ pid_t AIBinder_getCallingPid() {
 bool AIBinder_isHandlingTransaction() {
     return ::android::IPCThreadState::self()->getServingStackPointer() != nullptr;
 }
+#endif
 
 void AIBinder_incStrong(AIBinder* binder) {
     if (binder == nullptr) {
@@ -590,7 +767,7 @@ void AIBinder_incStrong(AIBinder* binder) {
 }
 void AIBinder_decStrong(AIBinder* binder) {
     if (binder == nullptr) {
-        LOG(ERROR) << __func__ << ": on null binder";
+        ALOGE("%s: on null binder", __func__);
         return;
     }
 
@@ -598,7 +775,7 @@ void AIBinder_decStrong(AIBinder* binder) {
 }
 int32_t AIBinder_debugGetRefCount(AIBinder* binder) {
     if (binder == nullptr) {
-        LOG(ERROR) << __func__ << ": on null binder";
+        ALOGE("%s: on null binder", __func__);
         return -1;
     }
 
@@ -636,15 +813,14 @@ void* AIBinder_getUserData(AIBinder* binder) {
 
 binder_status_t AIBinder_prepareTransaction(AIBinder* binder, AParcel** in) {
     if (binder == nullptr || in == nullptr) {
-        LOG(ERROR) << __func__ << ": requires non-null parameters binder (" << binder
-                   << ") and in (" << in << ").";
+        ALOGE("%s: requires non-null parameters binder (%p) and in (%p).", __func__, binder, in);
         return STATUS_UNEXPECTED_NULL;
     }
     const AIBinder_Class* clazz = binder->getClass();
     if (clazz == nullptr) {
-        LOG(ERROR) << __func__
-                   << ": Class must be defined for a remote binder transaction. See "
-                      "AIBinder_associateClass.";
+        ALOGE("%s: Class must be defined for a remote binder transaction. See "
+              "AIBinder_associateClass.",
+              __func__);
         return STATUS_INVALID_OPERATION;
     }
 
@@ -676,8 +852,21 @@ static void DestroyParcel(AParcel** parcel) {
 
 binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code, AParcel** in,
                                   AParcel** out, binder_flags_t flags) {
+    const AIBinder_Class* clazz = binder ? binder->getClass() : nullptr;
+
+    std::string sectionName;
+    bool tracingEnabled = get_trace_enabled_tags() & ATRACE_TAG_AIDL;
+    if (tracingEnabled) {
+        sectionName = getTraceSectionName(clazz, code, false /*isServer*/);
+        trace_begin(ATRACE_TAG_AIDL, sectionName.c_str());
+    }
+
+    scope_guard guard = make_scope_guard([&]() {
+        if (tracingEnabled) trace_end(ATRACE_TAG_AIDL);
+    });
+
     if (in == nullptr) {
-        LOG(ERROR) << __func__ << ": requires non-null in parameter";
+        ALOGE("%s: requires non-null in parameter", __func__);
         return STATUS_UNEXPECTED_NULL;
     }
 
@@ -687,27 +876,26 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code, APa
     AutoParcelDestroyer forIn(in, DestroyParcel);
 
     if (!isUserCommand(code)) {
-        LOG(ERROR) << __func__
-                   << ": Only user-defined transactions can be made from the NDK, but requested: "
-                   << code;
+        ALOGE("%s: Only user-defined transactions can be made from the NDK, but requested: %d",
+              __func__, code);
         return STATUS_UNKNOWN_TRANSACTION;
     }
 
     constexpr binder_flags_t kAllFlags = FLAG_PRIVATE_VENDOR | FLAG_ONEWAY | FLAG_CLEAR_BUF;
     if ((flags & ~kAllFlags) != 0) {
-        LOG(ERROR) << __func__ << ": Unrecognized flags sent: " << flags;
+        ALOGE("%s: Unrecognized flags sent: %d", __func__, flags);
         return STATUS_BAD_VALUE;
     }
 
     if (binder == nullptr || *in == nullptr || out == nullptr) {
-        LOG(ERROR) << __func__ << ": requires non-null parameters binder (" << binder << "), in ("
-                   << in << "), and out (" << out << ").";
+        ALOGE("%s: requires non-null parameters binder (%p), in (%p), and out (%p).", __func__,
+              binder, in, out);
         return STATUS_UNEXPECTED_NULL;
     }
 
     if ((*in)->getBinder() != binder) {
-        LOG(ERROR) << __func__ << ": parcel is associated with binder object " << binder
-                   << " but called with " << (*in)->getBinder();
+        ALOGE("%s: parcel is associated with binder object %p but called with %p", __func__, binder,
+              (*in)->getBinder());
         return STATUS_BAD_VALUE;
     }
 
@@ -727,7 +915,7 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code, APa
 AIBinder_DeathRecipient* AIBinder_DeathRecipient_new(
         AIBinder_DeathRecipient_onBinderDied onBinderDied) {
     if (onBinderDied == nullptr) {
-        LOG(ERROR) << __func__ << ": requires non-null onBinderDied parameter.";
+        ALOGE("%s: requires non-null onBinderDied parameter.", __func__);
         return nullptr;
     }
     auto ret = new AIBinder_DeathRecipient(onBinderDied);
@@ -793,16 +981,17 @@ binder_status_t AIBinder_setExtension(AIBinder* binder, AIBinder* ext) {
 
 void AIBinder_setRequestingSid(AIBinder* binder, bool requestingSid) {
     ABBinder* localBinder = binder->asABBinder();
-    if (localBinder == nullptr) {
-        LOG(FATAL) << "AIBinder_setRequestingSid must be called on a local binder";
-    }
+    LOG_ALWAYS_FATAL_IF(localBinder == nullptr,
+                        "AIBinder_setRequestingSid must be called on a local binder");
 
     localBinder->setRequestingSid(requestingSid);
 }
 
+#ifdef BINDER_WITH_KERNEL_IPC
 const char* AIBinder_getCallingSid() {
     return ::android::IPCThreadState::self()->getCallingSid();
 }
+#endif
 
 void AIBinder_setMinSchedulerPolicy(AIBinder* binder, int policy, int priority) {
     binder->asABBinder()->setMinSchedulerPolicy(policy, priority);
@@ -810,9 +999,8 @@ void AIBinder_setMinSchedulerPolicy(AIBinder* binder, int policy, int priority) 
 
 void AIBinder_setInheritRt(AIBinder* binder, bool inheritRt) {
     ABBinder* localBinder = binder->asABBinder();
-    if (localBinder == nullptr) {
-        LOG(FATAL) << "AIBinder_setInheritRt must be called on a local binder";
-    }
+    LOG_ALWAYS_FATAL_IF(localBinder == nullptr,
+                        "AIBinder_setInheritRt must be called on a local binder");
 
     localBinder->setInheritRt(inheritRt);
 }

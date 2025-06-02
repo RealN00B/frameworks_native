@@ -16,19 +16,24 @@
 
 #define LOG_TAG "LatencyTracker"
 #include "LatencyTracker.h"
+#include "../InputDeviceMetricsSource.h"
 
 #include <inttypes.h>
 
+#include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android/os/IInputConstants.h>
 #include <input/Input.h>
+#include <input/InputDevice.h>
 #include <log/log.h>
 
 using android::base::HwTimeoutMultiplier;
 using android::base::StringPrintf;
 
 namespace android::inputdispatcher {
+
+namespace {
 
 /**
  * Events that are older than this time will be considered mature, at which point we will stop
@@ -60,13 +65,31 @@ static void eraseByValue(std::multimap<K, V>& map, const V& value) {
     }
 }
 
-LatencyTracker::LatencyTracker(InputEventTimelineProcessor* processor)
-      : mTimelineProcessor(processor) {
-    LOG_ALWAYS_FATAL_IF(processor == nullptr);
+} // namespace
+
+LatencyTracker::LatencyTracker(InputEventTimelineProcessor& processor)
+      : mTimelineProcessor(&processor) {}
+
+void LatencyTracker::trackListener(const NotifyArgs& args) {
+    if (const NotifyKeyArgs* keyArgs = std::get_if<NotifyKeyArgs>(&args)) {
+        std::set<InputDeviceUsageSource> sources =
+                getUsageSourcesForKeyArgs(*keyArgs, mInputDevices);
+        trackListener(keyArgs->id, keyArgs->eventTime, keyArgs->readTime, keyArgs->deviceId,
+                      sources, keyArgs->action, InputEventType::KEY);
+
+    } else if (const NotifyMotionArgs* motionArgs = std::get_if<NotifyMotionArgs>(&args)) {
+        std::set<InputDeviceUsageSource> sources = getUsageSourcesForMotionArgs(*motionArgs);
+        trackListener(motionArgs->id, motionArgs->eventTime, motionArgs->readTime,
+                      motionArgs->deviceId, sources, motionArgs->action, InputEventType::MOTION);
+    } else {
+        LOG(FATAL) << "Unexpected NotifyArgs type: " << args.index();
+    }
 }
 
-void LatencyTracker::trackListener(int32_t inputEventId, bool isDown, nsecs_t eventTime,
-                                   nsecs_t readTime) {
+void LatencyTracker::trackListener(int32_t inputEventId, nsecs_t eventTime, nsecs_t readTime,
+                                   DeviceId deviceId,
+                                   const std::set<InputDeviceUsageSource>& sources,
+                                   int32_t inputEventAction, InputEventType inputEventType) {
     reportAndPruneMatureRecords(eventTime);
     const auto it = mTimelines.find(inputEventId);
     if (it != mTimelines.end()) {
@@ -78,7 +101,61 @@ void LatencyTracker::trackListener(int32_t inputEventId, bool isDown, nsecs_t ev
         eraseByValue(mEventTimes, inputEventId);
         return;
     }
-    mTimelines.emplace(inputEventId, InputEventTimeline(isDown, eventTime, readTime));
+
+    // Create an InputEventTimeline for the device ID. The vendorId and productId
+    // can be obtained from the InputDeviceIdentifier of the particular device.
+    const InputDeviceIdentifier* identifier = nullptr;
+    for (auto& inputDevice : mInputDevices) {
+        if (deviceId == inputDevice.getId()) {
+            identifier = &inputDevice.getIdentifier();
+            break;
+        }
+    }
+
+    // If no matching ids can be found for the device from among the input devices connected,
+    // the call to trackListener will be dropped.
+    // Note: there generally isn't expected to be a situation where we can't find an InputDeviceInfo
+    // but a possibility of it is handled in case of race conditions
+    if (identifier == nullptr) {
+        ALOGE("Could not find input device identifier. Dropping call to LatencyTracker.");
+        return;
+    }
+
+    const InputEventActionType inputEventActionType = [&]() {
+        switch (inputEventType) {
+            case InputEventType::MOTION: {
+                switch (MotionEvent::getActionMasked(inputEventAction)) {
+                    case AMOTION_EVENT_ACTION_DOWN:
+                        return InputEventActionType::MOTION_ACTION_DOWN;
+                    case AMOTION_EVENT_ACTION_MOVE:
+                        return InputEventActionType::MOTION_ACTION_MOVE;
+                    case AMOTION_EVENT_ACTION_UP:
+                        return InputEventActionType::MOTION_ACTION_UP;
+                    case AMOTION_EVENT_ACTION_HOVER_MOVE:
+                        return InputEventActionType::MOTION_ACTION_HOVER_MOVE;
+                    case AMOTION_EVENT_ACTION_SCROLL:
+                        return InputEventActionType::MOTION_ACTION_SCROLL;
+                    default:
+                        return InputEventActionType::UNKNOWN_INPUT_EVENT;
+                }
+            }
+            case InputEventType::KEY: {
+                switch (inputEventAction) {
+                    case AKEY_EVENT_ACTION_DOWN:
+                    case AKEY_EVENT_ACTION_UP:
+                        return InputEventActionType::KEY;
+                    default:
+                        return InputEventActionType::UNKNOWN_INPUT_EVENT;
+                }
+            }
+            default:
+                return InputEventActionType::UNKNOWN_INPUT_EVENT;
+        }
+    }();
+
+    mTimelines.emplace(inputEventId,
+                       InputEventTimeline(eventTime, readTime, identifier->vendor,
+                                          identifier->product, sources, inputEventActionType));
     mEventTimes.emplace(eventTime, inputEventId);
 }
 
@@ -148,7 +225,7 @@ void LatencyTracker::trackGraphicsLatency(
 void LatencyTracker::reportAndPruneMatureRecords(nsecs_t newEventTime) {
     while (!mEventTimes.empty()) {
         const auto& [oldestEventTime, oldestInputEventId] = *mEventTimes.begin();
-        if (isMatureEvent(oldestEventTime, newEventTime /*now*/)) {
+        if (isMatureEvent(oldestEventTime, /*now=*/newEventTime)) {
             // Report and drop this event
             const auto it = mTimelines.find(oldestInputEventId);
             LOG_ALWAYS_FATAL_IF(it == mTimelines.end(),
@@ -165,10 +242,14 @@ void LatencyTracker::reportAndPruneMatureRecords(nsecs_t newEventTime) {
     }
 }
 
-std::string LatencyTracker::dump(const char* prefix) {
+std::string LatencyTracker::dump(const char* prefix) const {
     return StringPrintf("%sLatencyTracker:\n", prefix) +
             StringPrintf("%s  mTimelines.size() = %zu\n", prefix, mTimelines.size()) +
             StringPrintf("%s  mEventTimes.size() = %zu\n", prefix, mEventTimes.size());
+}
+
+void LatencyTracker::setInputDevices(const std::vector<InputDeviceInfo>& inputDevices) {
+    mInputDevices = inputDevices;
 }
 
 } // namespace android::inputdispatcher

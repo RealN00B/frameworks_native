@@ -26,7 +26,7 @@
 #include <gui/ISurfaceComposer.h>
 #include <gui/SurfaceComposerClient.h>
 #include <gui/SurfaceControl.h>
-#include <private/gui/ComposerService.h>
+#include <private/gui/ComposerServiceAIDL.h>
 #include <utils/Trace.h>
 
 using namespace std::chrono_literals;
@@ -46,7 +46,8 @@ public:
 
         SurfaceComposerClient::Transaction{}
                 .setLayer(mButton, 0x7fffffff)
-                .setCrop(mButton, {0, 0, width - 2 * BUTTON_PADDING, height - 2 * BUTTON_PADDING})
+                .setCrop(mButton,
+                         Rect{0, 0, width - 2 * BUTTON_PADDING, height - 2 * BUTTON_PADDING})
                 .setPosition(mButton, samplingArea.left + BUTTON_PADDING,
                              samplingArea.top + BUTTON_PADDING)
                 .setColor(mButton, half3{1, 1, 1})
@@ -59,7 +60,8 @@ public:
         SurfaceComposerClient::Transaction{}
                 .setLayer(mButtonBlend, 0x7ffffffe)
                 .setCrop(mButtonBlend,
-                         {0, 0, width - 2 * SAMPLE_AREA_PADDING, height - 2 * SAMPLE_AREA_PADDING})
+                         Rect{0, 0, width - 2 * SAMPLE_AREA_PADDING,
+                              height - 2 * SAMPLE_AREA_PADDING})
                 .setPosition(mButtonBlend, samplingArea.left + SAMPLE_AREA_PADDING,
                              samplingArea.top + SAMPLE_AREA_PADDING)
                 .setColor(mButtonBlend, half3{1, 1, 1})
@@ -75,7 +77,7 @@ public:
 
             SurfaceComposerClient::Transaction{}
                     .setLayer(mSamplingArea, 0x7ffffffd)
-                    .setCrop(mSamplingArea, {0, 0, 100, 32})
+                    .setCrop(mSamplingArea, Rect{0, 0, 100, 32})
                     .setPosition(mSamplingArea, 490, 1606)
                     .setColor(mSamplingArea, half3{0, 1, 0})
                     .setAlpha(mSamplingArea, 0.1)
@@ -121,10 +123,22 @@ int main(int, const char**) {
     const Rect backButtonArea{200, 1606, 248, 1654};
     sp<android::Button> backButton = new android::Button("BackButton", backButtonArea);
 
-    sp<ISurfaceComposer> composer = ComposerService::getComposerService();
-    composer->addRegionSamplingListener(homeButtonArea, homeButton->getStopLayerHandle(),
+    gui::ARect homeButtonAreaA;
+    homeButtonAreaA.left = 490;
+    homeButtonAreaA.top = 1606;
+    homeButtonAreaA.right = 590;
+    homeButtonAreaA.bottom = 1654;
+
+    gui::ARect backButtonAreaA;
+    backButtonAreaA.left = 200;
+    backButtonAreaA.top = 1606;
+    backButtonAreaA.right = 248;
+    backButtonAreaA.bottom = 1654;
+
+    sp<gui::ISurfaceComposer> composer = ComposerServiceAIDL::getComposerService();
+    composer->addRegionSamplingListener(homeButtonAreaA, homeButton->getStopLayerHandle(),
                                         homeButton);
-    composer->addRegionSamplingListener(backButtonArea, backButton->getStopLayerHandle(),
+    composer->addRegionSamplingListener(backButtonAreaA, backButton->getStopLayerHandle(),
                                         backButton);
 
     ProcessState::self()->startThreadPool();

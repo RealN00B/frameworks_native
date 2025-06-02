@@ -18,9 +18,11 @@
 
 #include <compositionengine/ProjectionSpace.h>
 #include <compositionengine/impl/HwcBufferCache.h>
+#include <gui/DisplayLuts.h>
 #include <renderengine/ExternalTexture.h>
 #include <ui/FloatRect.h>
 #include <ui/GraphicTypes.h>
+#include <ui/PictureProfileHandle.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 
@@ -63,8 +65,14 @@ struct OutputLayerCompositionState {
     // The portion of the layer that is not obscured and is also opaque
     Region visibleNonTransparentRegion;
 
-    // The portion of the layer that is obscured by opaque layers on top
+    // The portion of the layer that is obscured by all layers on top. This includes transparent and
+    // opaque.
     Region coveredRegion;
+
+    // The portion of the layer that is obscured by all layers on top excluding display overlays.
+    // This only has a value if there's something needing it, like when a
+    // TrustedPresentationListener is set.
+    std::optional<Region> coveredRegionExcludingDisplayOverlays;
 
     // The visibleRegion transformed to output space
     Region outputSpaceVisibleRegion;
@@ -84,7 +92,7 @@ struct OutputLayerCompositionState {
     // The source crop for this layer on this output
     FloatRect sourceCrop;
 
-    // The buffer transform to use for this layer o on this output.
+    // The buffer transform to use for this layer on this output.
     Hwc2::Transform bufferTransform{static_cast<Hwc2::Transform>(0)};
 
     // The dataspace for this layer
@@ -93,6 +101,9 @@ struct OutputLayerCompositionState {
     // A hint to the HWC that this region is transparent and may be skipped in
     // order to save power.
     Region outputSpaceBlockingRegionHint;
+
+    // The picture profile for this layer.
+    PictureProfileHandle pictureProfileHandle;
 
     // Overrides the buffer, acquire fence, and display frame stored in LayerFECompositionState
     struct {
@@ -136,11 +147,18 @@ struct OutputLayerCompositionState {
         // cost of sending reused buffers to the HWC.
         HwcBufferCache hwcBufferCache;
 
+        // The previously-active buffer for this layer.
+        uint64_t activeBufferId;
+        uint32_t activeBufferSlot;
+
         // Set to true when overridden info has been sent to HW composer
         bool stateOverridden = false;
 
         // True when this layer was skipped as part of SF-side layer caching.
         bool layerSkipped = false;
+
+        // lut information
+        std::shared_ptr<gui::DisplayLuts> luts;
     };
 
     // The HWC state is optional, and is only set up if there is any potential
